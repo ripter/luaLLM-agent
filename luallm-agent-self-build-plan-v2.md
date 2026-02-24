@@ -55,7 +55,7 @@ Behavior:
 4. Print: file path, model used, token count
 
 
-### Step 1A.2 — `generate-with-context` command
+### ✅ Step 1A.2 — `generate-with-context` command (Done)
 
 ```
 lua main.lua generate-with-context <output_path> <context_file1> [context_file2 ...] "prompt"
@@ -82,7 +82,7 @@ This is critical because every Phase 1B module needs to call into existing modul
 
 ---
 
-## Phase 1B — Agent-Built Modules
+## ✅ Phase 1B — Agent-Built Modules (working)
 
 Each step uses `generate-with-context` to produce a module. The human reviews and installs.
 

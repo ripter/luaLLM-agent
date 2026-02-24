@@ -88,11 +88,20 @@ end
 function M.run(deps, args)
   local config       = deps.config
   local cmd_generate = deps.cmd_generate
+  local safe_fs      = deps.safe_fs
 
   pcall(config.load)
 
   if not args.context_paths or #args.context_paths == 0 then
     return nil, "generate-with-context requires at least one context file"
+  end
+
+  -- Check each context file path is permitted before reading anything.
+  for _, path in ipairs(args.context_paths) do
+    local allowed, err = safe_fs.is_allowed(path)
+    if not allowed then
+      return nil, "context file not allowed: " .. tostring(err)
+    end
   end
 
   -- Read all context files (respects size cap).

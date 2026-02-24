@@ -21,15 +21,19 @@ local DEFAULT_BINARY = "luallm"
 -- Truncation limit for error response bodies.
 local MAX_BODY_IN_ERR = 2048
 
--- LLM inference can be slow. Override luasocket's default 60s timeout with
--- the value from config (limits.llm_timeout_seconds, default 120), and apply
--- it to socket.http before each request.
-local function get_timeout()
+-- LLM inference can be slow — especially for large context payloads.
+-- Override luasocket's default 60s with limits.llm_timeout_seconds (default 300s).
+-- complete() also accepts options._timeout to allow per-call overrides without
+-- touching the global config (used by generate commands for longer tasks).
+local function get_timeout(override)
+  if type(override) == "number" and override > 0 then
+    return override
+  end
   local ok, val = pcall(config.get, "limits.llm_timeout_seconds")
   if ok and type(val) == "number" and val > 0 then
     return val
   end
-  return 120
+  return 300
 end
 
 -- ---------------------------------------------------------------------------
@@ -188,10 +192,17 @@ function M.complete(model_name, messages, options, port)
   end
 
   -- Build request payload.
+  -- options._timeout is a private per-call override, not an API field — extract
+  -- it before merging the rest of options into the payload.
+  local timeout_override = nil
   local payload = { model = model_name, messages = messages }
   if type(options) == "table" then
     for k, v in pairs(options) do
-      payload[k] = v
+      if k == "_timeout" then
+        timeout_override = v
+      else
+        payload[k] = v
+      end
     end
   end
 
@@ -202,10 +213,10 @@ function M.complete(model_name, messages, options, port)
 
   local url = "http://127.0.0.1:" .. port .. "/v1/chat/completions"
 
-  -- Collect response body via ltn12 sink.
-  -- Apply timeout before the request — luasocket's default 60s is too short
-  -- for LLM inference. TIMEOUT is checked per-connection by socket.http.
-  http.TIMEOUT = get_timeout()
+  -- Apply timeout before the request. luasocket's http.TIMEOUT is checked
+  -- per-connection. We use a per-call override if provided, otherwise fall
+  -- back to config (limits.llm_timeout_seconds, default 300s).
+  http.TIMEOUT = get_timeout(timeout_override)
   local resp_chunks = {}
   local result, status, resp_headers, status_line = http.request({
     url     = url,

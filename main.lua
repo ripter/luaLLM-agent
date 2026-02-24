@@ -153,15 +153,24 @@ end
 -- ---------------------------------------------------------------------------
 
 local function run_generate(args)
-  local luallm  = require("luallm")
-  local safe_fs = require("safe_fs")
-  local config  = require("config")
+  local luallm      = require("luallm")
+  local safe_fs     = require("safe_fs")
+  local config      = require("config")
+  local cmd_gen     = require("cmd_generate")
+
+  local prompt, prompt_err = cmd_gen.resolve_prompt(args.prompt)
+  if not prompt then
+    print("")
+    print(co("%{red}", "  ✗ " .. tostring(prompt_err)))
+    print("")
+    os.exit(1)
+  end
 
   io.write(co("%{dim}", "  generating…") .. "\n")
 
-  local ok, err_or_info = require("cmd_generate").run(
+  local ok, err_or_info = cmd_gen.run(
     { luallm = luallm, safe_fs = safe_fs, config = config },
-    { output_path = args.output_path, prompt = args.prompt }
+    { output_path = args.output_path, prompt = prompt }
   )
 
   if not ok then
@@ -188,9 +197,27 @@ local function run_generate_with_context(args)
   local config  = require("config")
   local cmd_gen = require("cmd_generate")
 
-  local context_paths = args.context
-  local prompt        = args.prompt
+  local prompt, prompt_err = cmd_gen.resolve_prompt(args.prompt)
+  if not prompt then
+    print("")
+    print(co("%{red}", "  ✗ " .. tostring(prompt_err)))
+    print("")
+    os.exit(1)
+  end
 
+  -- Show where the prompt came from so the user can confirm the right source.
+  local prompt_source
+  if args.prompt == "-" then
+    prompt_source = "stdin"
+  elseif args.prompt:sub(1,1) == "@" then
+    prompt_source = args.prompt:sub(2)
+  else
+    prompt_source = "inline"
+  end
+
+  local context_paths = args.context
+
+  io.write(co("%{dim}", "  prompt: " .. prompt_source) .. "\n")
   io.write(co("%{dim}", "  reading " .. #context_paths .. " context file(s)…") .. "\n")
   io.write(co("%{dim}", "  generating…") .. "\n")
 
@@ -257,11 +284,26 @@ local COMMANDS = {
       parser:argument("output_path", "File path to write the generated Lua code to.")
       parser:argument("prompt",      "Description of the Lua code to generate.")
     end,
+    detail = [[
+  Arguments:
+    output_path   File to write the generated Lua code to (must be in allowed_paths).
+    prompt        What to generate. Three forms are accepted:
+
+                  Inline string (most common):
+                    lua main.lua generate out.lua "write a config loader"
+
+                  File prefixed with @  — reads the prompt from a file:
+                    lua main.lua generate out.lua @prompts/my_prompt.md
+
+                  Stdin via -  — pipe or type the prompt interactively:
+                    cat prompt.md | lua main.lua generate out.lua -
+                    lua main.lua generate out.lua -   (then type, then Ctrl-D)
+    ]],
   },
   {
     name  = "generate-with-context",
     usage = "<output_path> <prompt> <context_file>...",
-    desc  = "Generate Lua code using existing source files as context.",
+    desc  = "Generate Lua code with existing source files provided as context.",
     fn    = run_generate_with_context,
     setup = function(parser)
       parser:argument("output_path", "File path to write the generated Lua code to.")
@@ -269,6 +311,43 @@ local COMMANDS = {
       parser:argument("context",     "Source file(s) to include as context.")
             :args("+")
     end,
+    detail = [[
+  Arguments:
+    output_path     File to write the generated Lua code to (must be in allowed_paths).
+    prompt          What to generate. Three forms are accepted:
+
+                    Inline string (most common):
+                      ./agent generate-with-context out.lua "write a cache module" src/config.lua
+
+                    File prefixed with @  — reads the prompt from a .md or .txt file.
+                    Useful when your prompt is long or you want to version-control it:
+                      ./agent generate-with-context out.lua @prompts/cache.md src/config.lua
+
+                    Stdin via -  — pipe or type the prompt interactively.
+                    Useful for composing prompts with other shell tools:
+                      cat prompts/cache.md | ./agent generate-with-context out.lua - src/config.lua
+                      echo "write a cache" | ./agent generate-with-context out.lua - src/a.lua src/b.lua
+
+    context_file... One or more existing Lua source files passed to the model as
+                    reference material. The model sees their full contents, so it
+                    can match your conventions, use the right require() paths, and
+                    call real APIs instead of hallucinating them.
+
+                    Pass the files you expect the generated module to import or
+                    interact with. For example, if generating a new command module:
+                      ./agent generate-with-context src/cmd_foo.lua @prompts/foo.md \
+                        src/config.lua src/luallm.lua src/safe_fs.lua
+
+                    Total context size is capped at generate.max_context_bytes in
+                    config.json (default 64 KB). Reduce files or raise the cap if
+                    you hit the limit.
+
+  Timeouts:
+    Large context payloads take longer to process. If you see timeout errors,
+    set generate.timeout_seconds in config.json to override the global limit:
+      "generate": { "timeout_seconds": 600 }
+    The global fallback is limits.llm_timeout_seconds (default 300s).
+    ]],
   },
 }
 
@@ -283,7 +362,22 @@ local function print_help(cmd_name)
         print("")
         print(co("%{bright cyan}", "  " .. cmd.name)
               .. (cmd.usage ~= "" and "  " .. co("%{dim}", cmd.usage) or ""))
+        print("")
         print("  " .. cmd.desc)
+        if cmd.detail then
+          print("")
+          -- detail is a multiline string; print each line with dim styling
+          -- for the section headers and normal text for the rest.
+          for line in (cmd.detail):gmatch("([^\n]*)\n?") do
+            local trimmed = line:match("^%s*(.-)%s*$")
+            if trimmed:match("^%u%l+:") or trimmed:match("^%u[%u%s]+:") then
+              -- "Arguments:", "Options:", etc — print as a bright header
+              print(co("%{bright white}", "  " .. line))
+            else
+              print(co("%{dim}", line))
+            end
+          end
+        end
         print("")
         return
       end

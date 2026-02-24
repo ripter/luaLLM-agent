@@ -106,6 +106,46 @@ function M.build_context_prompt(file_records, user_prompt)
   return table.concat(parts, "\n")
 end
 
+--- Resolve the final prompt string from a raw argument.
+--- Three forms are supported:
+---   "-"          → read from stdin
+---   "@<path>"    → read from the file at <path>
+---   anything else → use as a literal prompt string
+---
+--- Returns (prompt_string, nil) on success, or (nil, error_string) on failure.
+function M.resolve_prompt(raw)
+  if raw == "-" then
+    local content = io.read("*a")
+    if not content or content == "" then
+      return nil, "prompt from stdin was empty"
+    end
+    return content, nil
+  end
+
+  if raw:sub(1, 1) == "@" then
+    local path = raw:sub(2)
+    if path == "" then
+      return nil, "@ prefix requires a file path, e.g. @prompts/my_prompt.md"
+    end
+    local f, err = io.open(path, "r")
+    if not f then
+      return nil, "cannot open prompt file '" .. path .. "': " .. tostring(err)
+    end
+    local content = f:read("*a")
+    f:close()
+    if not content or content == "" then
+      return nil, "prompt file is empty: " .. path
+    end
+    return content, nil
+  end
+
+  if raw == "" then
+    return nil, "prompt cannot be an empty string"
+  end
+
+  return raw, nil
+end
+
 -- ---------------------------------------------------------------------------
 -- Shared inner runner
 -- ---------------------------------------------------------------------------
@@ -151,6 +191,14 @@ local function run_inner(deps, args)
     sanitize = false
   end
 
+  -- Per-generate timeout: generate.timeout_seconds overrides the global limit.
+  -- Large context payloads need significantly more time than quick prompts.
+  local gen_timeout = nil
+  local gt_ok, gt_val = pcall(config.get, "generate.timeout_seconds")
+  if gt_ok and type(gt_val) == "number" and gt_val > 0 then
+    gen_timeout = gt_val
+  end
+
   local state, state_err = luallm.state()
   if not state then
     return nil, "could not reach luallm: " .. tostring(state_err)
@@ -164,7 +212,7 @@ local function run_inner(deps, args)
   local response, req_err = luallm.complete(model, {
     { role = "system", content = sys_prompt },
     { role = "user",   content = prompt     },
-  }, nil, port)
+  }, gen_timeout and { _timeout = gen_timeout } or nil, port)
 
   if not response then
     return nil, "LLM request failed: " .. tostring(req_err)
@@ -185,10 +233,10 @@ local function run_inner(deps, args)
 
   local write_ok, write_err = safe_fs.write_file(output_path, content_text, allowed, blocked)
   if not write_ok then
-    return nil, "failed to write output file: " .. tostring(write_err)
+    return nil, write_err
   end
 
-  local tokens = "unknown"
+  local tokens = "0"
   if response.usage and response.usage.total_tokens then
     tokens = tostring(math.floor(response.usage.total_tokens))
   elseif response.usage and response.usage.completion_tokens then

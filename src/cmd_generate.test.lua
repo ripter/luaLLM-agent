@@ -277,3 +277,69 @@ describe("cmd_generate.run", function()
   end)
 
 end)
+-- ---------------------------------------------------------------------------
+-- resolve_prompt
+-- ---------------------------------------------------------------------------
+
+describe("cmd_generate.resolve_prompt", function()
+
+  it("returns a plain string unchanged", function()
+    local result, err = cmd_generate.resolve_prompt("write a thing")
+    assert.is_nil(err)
+    assert.equals("write a thing", result)
+  end)
+
+  it("returns error for empty string", function()
+    local result, err = cmd_generate.resolve_prompt("")
+    assert.is_nil(result)
+    assert.is_truthy(err:find("empty"))
+  end)
+
+  it("reads prompt from a real file via @ prefix", function()
+    local lfs  = require("lfs")
+    local path = lfs.currentdir() .. "/tmp_prompt_test.md"
+    local f    = assert(io.open(path, "w"))
+    f:write("Generate a cache module.\n")
+    f:close()
+
+    local result, err = cmd_generate.resolve_prompt("@" .. path)
+    os.remove(path)
+
+    assert.is_nil(err)
+    assert.equals("Generate a cache module.\n", result)
+  end)
+
+  it("returns error when @ file does not exist", function()
+    local result, err = cmd_generate.resolve_prompt("@/nonexistent/no_such_file.md")
+    assert.is_nil(result)
+    assert.is_truthy(err:find("cannot open prompt file"))
+  end)
+
+  it("returns error for bare @ with no path", function()
+    local result, err = cmd_generate.resolve_prompt("@")
+    assert.is_nil(result)
+    assert.is_truthy(err:find("requires a file path"))
+  end)
+
+  it("treats a string starting with @ as a file path, not literal", function()
+    -- Confirm a valid @file is NOT returned as the literal string "@file"
+    local lfs  = require("lfs")
+    local path = lfs.currentdir() .. "/tmp_at_test.md"
+    local f    = assert(io.open(path, "w"))
+    f:write("hello\n")
+    f:close()
+
+    local result, err = cmd_generate.resolve_prompt("@" .. path)
+    os.remove(path)
+
+    assert.is_nil(err)
+    assert.equals("hello\n", result)
+    -- Explicitly confirm the raw "@path" string was not returned
+    assert.is_falsy(result == ("@" .. path))
+  end)
+
+  -- Note: stdin ("-") is not tested here because redirecting io.read in busted
+  -- is not portable. The logic is a single io.read("*a") branch and is verified
+  -- by manual testing.
+
+end)
