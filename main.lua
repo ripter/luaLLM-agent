@@ -1,7 +1,7 @@
 #!/usr/bin/env lua
 
 -- ---------------------------------------------------------------------------
--- main.lua — luaLLM-agent CLI runner
+-- main.lua — luaLLM-agent CLI dispatcher
 -- Rocks: argparse, ansicolors, luafilesystem (lfs)
 -- ---------------------------------------------------------------------------
 
@@ -10,6 +10,7 @@ local argparse = require "argparse"
 local lfs      = require "lfs"
 
 local script_dir = arg[0]:match("(.*/)") or "./"
+package.path = script_dir .. "src/?.lua;" .. package.path
 
 -- Shorthand: apply an ansicolors tag to text and reset after.
 local function co(tag, text)
@@ -20,17 +21,13 @@ end
 -- Command: test
 -- ---------------------------------------------------------------------------
 
---- Recursively collect files matching a suffix under a directory,
---- returned in sorted order. Uses lfs.dir() — no shell subprocess needed.
 local function find_files(dir, suffix, results)
   results = results or {}
   local attr = lfs.attributes(dir)
   if not attr or attr.mode ~= "directory" then return results end
   local entries = {}
   for entry in lfs.dir(dir) do
-    if entry ~= "." and entry ~= ".." then
-      entries[#entries + 1] = entry
-    end
+    if entry ~= "." and entry ~= ".." then entries[#entries + 1] = entry end
   end
   table.sort(entries)
   for _, entry in ipairs(entries) do
@@ -49,9 +46,7 @@ end
 
 local function run_tests()
   local src_dir = script_dir .. "src"
-
-  -- Sanity-check: make sure there are test files before invoking busted
-  local files = find_files(src_dir, ".test.lua")
+  local files   = find_files(src_dir, ".test.lua")
   if #files == 0 then
     print("")
     print(co("%{yellow}", "  ⚠  No test files found")
@@ -59,24 +54,17 @@ local function run_tests()
     print("")
     os.exit(0)
   end
-
-  -- Hand off entirely to busted — it owns discovery, output, and exit code.
-  -- --pattern matches any file ending in .test.lua anywhere under src/
   local cmd = string.format('busted --pattern=".test.lua$" "%s"', src_dir)
   os.exit(os.execute(cmd) == true and 0 or 1)
 end
-
 
 -- ---------------------------------------------------------------------------
 -- Command: doctor
 -- ---------------------------------------------------------------------------
 
 local function run_doctor(args)
-  -- Add src/ to path so doctor.lua can find its siblings.
-  package.path = script_dir .. "src/?.lua;" .. package.path
   local doctor = require("doctor")
-
-  local fix = args and args.fix
+  local fix    = args and args.fix
 
   print("")
   if fix then
@@ -88,9 +76,8 @@ local function run_doctor(args)
   end
   print("")
 
-  local results = doctor.run(fix)
-  local n_ok    = 0
-  local n_fail  = 0
+  local results = require("cmd_doctor").run({ doctor = doctor }, fix)
+  local n_ok, n_fail = 0, 0
 
   for _, r in ipairs(results) do
     if r.ok then
@@ -102,7 +89,6 @@ local function run_doctor(args)
       end
     else
       n_fail = n_fail + 1
-      -- Fixed but still failing (e.g. luarocks install failed)
       if r.fixed == false then
         print(co("%{yellow}", "  ~ ") .. co("%{bright white}", r.name))
         print(co("%{yellow}", "      fix attempted but failed:"))
@@ -132,7 +118,6 @@ local function run_doctor(args)
     end
   end
   print("")
-
   os.exit(n_fail > 0 and 1 or 0)
 end
 
@@ -141,69 +126,25 @@ end
 -- ---------------------------------------------------------------------------
 
 local function run_quick_prompt(args)
-  package.path = script_dir .. "src/?.lua;" .. package.path
   local luallm = require("luallm")
+  local config = require("config")
 
-  local prompt = args.prompt
+  local content, err_or_info = require("cmd_quick").run(
+    { luallm = luallm, config = config },
+    { prompt = args.prompt }
+  )
 
-  -- One status call to get both model name and port — complete() reuses it.
-  local state, state_err = luallm.state()
-  if not state then
+  if not content then
     print("")
-    print(co("%{red}", "  ✗ Could not reach luallm:"))
-    print(co("%{yellow}", "    " .. tostring(state_err)))
+    print(co("%{red}", "  ✗ " .. tostring(err_or_info)))
     print(co("%{dim}", "    Is luallm running? Try: lua main.lua doctor"))
     print("")
     os.exit(1)
   end
 
-  local model, port
-  for _, entry in ipairs(state.servers or {}) do
-    if entry.state == "running" and (entry.model or entry.name) and entry.port then
-      model = entry.model or entry.name
-      port  = math.floor(entry.port)
-      break
-    end
-  end
-
-  if not model then
-    print("")
-    print(co("%{red}", "  ✗ No running model found in luallm status"))
-    print(co("%{dim}", "    Is luallm running? Try: lua main.lua doctor"))
-    print("")
-    os.exit(1)
-  end
-
-  io.write(co("%{dim}", "  model: " .. model .. "  …") .. "\n")
-
-  local response, req_err = luallm.complete(model, {
-    { role = "user", content = prompt },
-  }, nil, port)
-
-  if not response then
-    print("")
-    print(co("%{red}", "  ✗ Request failed:"))
-    print(co("%{yellow}", "    " .. tostring(req_err)))
-    print("")
-    os.exit(1)
-  end
-
-  -- Extract content from OpenAI-style response.
-  local content_text = response.choices
-                   and response.choices[1]
-                   and response.choices[1].message
-                   and response.choices[1].message.content
-
-  if not content_text then
-    print("")
-    print(co("%{red}", "  ✗ Unexpected response shape (no choices[1].message.content)"))
-    print(co("%{dim}", "    " .. require("cjson.safe").encode(response):sub(1, 300)))
-    print("")
-    os.exit(1)
-  end
-
+  io.write(co("%{dim}", "  model: " .. err_or_info.model .. "  …") .. "\n")
   print("")
-  print(content_text)
+  print(content)
   print("")
 end
 
@@ -211,153 +152,75 @@ end
 -- Command: generate
 -- ---------------------------------------------------------------------------
 
--- Default system prompt for Lua code generation.
--- Override via generate.system_prompt in config.json.
-local DEFAULT_GENERATE_SYSTEM_PROMPT =
-  "You are a Lua code generator. Output ONLY valid Lua code. " ..
-  "No markdown fences, no explanations, no commentary. " ..
-  "Start with the first line of code."
-
 local function run_generate(args)
-  package.path = script_dir .. "src/?.lua;" .. package.path
   local luallm  = require("luallm")
   local safe_fs = require("safe_fs")
   local config  = require("config")
 
-  local output_path = args.output_path
-  local prompt      = args.prompt
+  io.write(co("%{dim}", "  generating…") .. "\n")
 
-  -- Load config for policy and optional overrides.
-  pcall(config.load)
+  local ok, err_or_info = require("cmd_generate").run(
+    { luallm = luallm, safe_fs = safe_fs, config = config },
+    { output_path = args.output_path, prompt = args.prompt }
+  )
 
-  -- Resolve path policy from config.
-  local allowed = (pcall(config.get, "allowed_paths") and config.get("allowed_paths")) or {}
-  local blocked = (pcall(config.get, "blocked_paths") and config.get("blocked_paths")) or {}
-
-  -- Validate policy before doing any LLM work.
-  local pol_ok, pol_err = safe_fs.validate_policy(allowed, blocked)
-  if not pol_ok then
+  if not ok then
     print("")
-    print(co("%{red}", "  ✗ Path policy is invalid:"))
-    print(co("%{yellow}", "    " .. tostring(pol_err)))
-    print(co("%{dim}", "    Fix allowed_paths / blocked_paths in your config, then retry."))
-    print(co("%{dim}", "    Run: lua main.lua doctor"))
+    print(co("%{red}", "  ✗ " .. tostring(err_or_info)))
     print("")
     os.exit(1)
-  end
-
-  -- Check write permission before spending time on LLM inference.
-  local allowed_ok, allowed_err = safe_fs.is_allowed(output_path, allowed, blocked)
-  if not allowed_ok then
-    print("")
-    print(co("%{red}", "  ✗ Write not permitted:"))
-    print(co("%{yellow}", "    " .. tostring(allowed_err)))
-    print("")
-    os.exit(1)
-  end
-
-  -- Resolve system prompt (config override or default).
-  local sys_prompt
-  local sp_ok, sp_val = pcall(config.get, "generate.system_prompt")
-  if sp_ok and type(sp_val) == "string" and sp_val ~= "" then
-    sys_prompt = sp_val
-  else
-    sys_prompt = DEFAULT_GENERATE_SYSTEM_PROMPT
-  end
-
-  -- Discover model and port in one status call.
-  local state, state_err = luallm.state()
-  if not state then
-    print("")
-    print(co("%{red}", "  ✗ Could not reach luallm:"))
-    print(co("%{yellow}", "    " .. tostring(state_err)))
-    print(co("%{dim}", "    Is luallm running? Try: lua main.lua doctor"))
-    print("")
-    os.exit(1)
-  end
-
-  local model, port
-  for _, entry in ipairs(state.servers or {}) do
-    if entry.state == "running" and (entry.model or entry.name) and entry.port then
-      model = entry.model or entry.name
-      port  = math.floor(entry.port)
-      break
-    end
-  end
-
-  -- Allow config to override the model choice.
-  local cfg_model_ok, cfg_model = pcall(config.get, "luallm.model")
-  if cfg_model_ok and type(cfg_model) == "string" and cfg_model ~= "" then
-    model = cfg_model
-    -- When a specific model is configured, look up its port fresh.
-    port = nil
-  end
-
-  if not model then
-    print("")
-    print(co("%{red}", "  ✗ No running model found in luallm status"))
-    print(co("%{dim}", "    Is luallm running? Try: lua main.lua doctor"))
-    print("")
-    os.exit(1)
-  end
-
-  io.write(co("%{dim}", "  model: " .. model .. "  generating…") .. "\n")
-
-  local response, req_err = luallm.complete(model, {
-    { role = "system", content = sys_prompt },
-    { role = "user",   content = prompt     },
-  }, nil, port)
-
-  if not response then
-    print("")
-    print(co("%{red}", "  ✗ LLM request failed:"))
-    print(co("%{yellow}", "    " .. tostring(req_err)))
-    print("")
-    os.exit(1)
-  end
-
-  local content_text = response.choices
-                   and response.choices[1]
-                   and response.choices[1].message
-                   and response.choices[1].message.content
-
-  if not content_text then
-    print("")
-    print(co("%{red}", "  ✗ Unexpected response shape (no choices[1].message.content)"))
-    print(co("%{dim}", "    " .. require("cjson.safe").encode(response):sub(1, 300)))
-    print("")
-    os.exit(1)
-  end
-
-  -- Write file (policy already checked above, but write_file re-checks for safety).
-  local write_ok, write_err = safe_fs.write_file(output_path, content_text, allowed, blocked)
-  if not write_ok then
-    print("")
-    print(co("%{red}", "  ✗ Failed to write output file:"))
-    print(co("%{yellow}", "    " .. tostring(write_err)))
-    print("")
-    os.exit(1)
-  end
-
-  -- Extract token usage.
-  local tokens = "unknown"
-  if response.usage and response.usage.total_tokens then
-    tokens = tostring(math.floor(response.usage.total_tokens))
-  elseif response.usage and response.usage.completion_tokens then
-    tokens = tostring(math.floor(response.usage.completion_tokens)) .. " (completion)"
   end
 
   print("")
-  print(co("%{bright green}", "  ✓ ") .. co("%{bright white}", "Wrote:  ") .. output_path)
-  print(co("%{dim}",          "    ")  .. co("%{bright white}", "Model:  ") .. model)
-  print(co("%{dim}",          "    ")  .. co("%{bright white}", "Tokens: ") .. tokens)
+  print(co("%{bright green}", "  ✓ ") .. co("%{bright white}", "Wrote:  ") .. err_or_info.output_path)
+  print(co("%{dim}",          "    ")  .. co("%{bright white}", "Model:  ") .. err_or_info.model)
+  print(co("%{dim}",          "    ")  .. co("%{bright white}", "Tokens: ") .. err_or_info.tokens)
+  print("")
+end
+
+-- ---------------------------------------------------------------------------
+-- Command: generate-with-context
+-- ---------------------------------------------------------------------------
+
+local function run_generate_with_context(args)
+  local luallm  = require("luallm")
+  local safe_fs = require("safe_fs")
+  local config  = require("config")
+  local cmd_gen = require("cmd_generate")
+
+  local context_paths = args.context
+  local prompt        = args.prompt
+
+  io.write(co("%{dim}", "  reading " .. #context_paths .. " context file(s)…") .. "\n")
+  io.write(co("%{dim}", "  generating…") .. "\n")
+
+  local ok, err_or_info = require("cmd_generate_context").run(
+    { luallm       = luallm,
+      safe_fs      = safe_fs,
+      config       = config,
+      cmd_generate = cmd_gen },
+    { output_path   = args.output_path,
+      context_paths = context_paths,
+      prompt        = prompt }
+  )
+
+  if not ok then
+    print("")
+    print(co("%{red}", "  ✗ " .. tostring(err_or_info)))
+    print("")
+    os.exit(1)
+  end
+
+  print("")
+  print(co("%{bright green}", "  ✓ ") .. co("%{bright white}", "Wrote:  ") .. err_or_info.output_path)
+  print(co("%{dim}",          "    ")  .. co("%{bright white}", "Model:  ") .. err_or_info.model)
+  print(co("%{dim}",          "    ")  .. co("%{bright white}", "Tokens: ") .. err_or_info.tokens)
+  print(co("%{dim}",          "    ")  .. co("%{bright white}", "Context files: ") .. #context_paths)
   print("")
 end
 
 -- ---------------------------------------------------------------------------
 -- Command registry
--- To add a new command: append an entry here, then add its argparse options
--- in the dispatch section below.
 -- ---------------------------------------------------------------------------
 
 local COMMANDS = {
@@ -395,15 +258,26 @@ local COMMANDS = {
       parser:argument("prompt",      "Description of the Lua code to generate.")
     end,
   },
+  {
+    name  = "generate-with-context",
+    usage = "<output_path> <prompt> <context_file>...",
+    desc  = "Generate Lua code using existing source files as context.",
+    fn    = run_generate_with_context,
+    setup = function(parser)
+      parser:argument("output_path", "File path to write the generated Lua code to.")
+      parser:argument("prompt",      "Description of the Lua code to generate.")
+      parser:argument("context",     "Source file(s) to include as context.")
+            :args("+")
+    end,
+  },
 }
 
 -- ---------------------------------------------------------------------------
--- Colored help printer
+-- Help printer
 -- ---------------------------------------------------------------------------
 
 local function print_help(cmd_name)
   if cmd_name then
-    -- Per-command help
     for _, cmd in ipairs(COMMANDS) do
       if cmd.name == cmd_name then
         print("")
@@ -421,7 +295,6 @@ local function print_help(cmd_name)
     os.exit(1)
   end
 
-  -- Full help
   print("")
   print(co("%{bright magenta}", "  luaLLM-agent") .. co("%{dim}", " — a Lua LLM agent framework"))
   print("")
@@ -435,7 +308,6 @@ local function print_help(cmd_name)
                      or string.rep(" ", 18)
     print(co("%{cyan}", name_col) .. args_col .. cmd.desc)
   end
-  -- help is meta; add it manually so it appears in the listing
   print(co("%{cyan}", string.format("    %-12s", "help"))
         .. co("%{dim}", string.format("%-18s", "[command]"))
         .. "Show this help message, or help for a specific command.")
@@ -456,14 +328,12 @@ end
 local cmd_name = arg[1]
 
 if cmd_name == nil or cmd_name == "help" or cmd_name == "-h" or cmd_name == "--help" then
-  -- bare help / flags → full help; "help <cmd>" → per-command help
   print_help(arg[2])
 else
   local matched = false
   for _, cmd in ipairs(COMMANDS) do
     if cmd.name == cmd_name then
       matched = true
-      -- Give each command its own argparse parser so it gets --help for free
       local parser = argparse("lua main.lua " .. cmd.name, cmd.desc)
       if cmd.setup then cmd.setup(parser) end
       local sub_arg = {}

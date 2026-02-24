@@ -40,7 +40,7 @@ Since `quick-prompt` works, the fastest path to self-build is:
 
 Goal: A `generate` command that sends a system prompt + user prompt to the LLM and writes the response to a file. This is the tool the agent uses to build itself.
 
-### Step 1A.1 — `generate` command
+### ✅ Step 1A.1 — `generate` command (done)
 
 Add to `main.lua`:
 
@@ -54,7 +54,6 @@ Behavior:
 3. Write the response content to `<output_path>`
 4. Print: file path, model used, token count
 
-This is ~30 lines on top of the existing `quick-prompt` logic.
 
 ### Step 1A.2 — `generate-with-context` command
 
