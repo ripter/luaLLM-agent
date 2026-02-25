@@ -139,17 +139,60 @@ function M.execute(skill_name, args, search_dirs)
 end
 
 -- ---------------------------------------------------------------------------
+-- Lua interpreter detection (cached at module load)
+-- ---------------------------------------------------------------------------
+
+--- Probe for an available Lua interpreter binary.
+--- Tries the running interpreter first (via arg global), then common names.
+local LUA_BIN = (function()
+  -- arg[-1] typically holds the interpreter path used to start the process.
+  -- However, busted (via luarocks) may stuff a full Lua bootstrap snippet
+  -- into arg[-1], which is not a usable binary path.  Only trust it if it
+  -- looks like a plain filesystem path (no spaces, parens, or semicolons).
+  if type(arg) == "table" and type(arg[-1]) == "string" and arg[-1] ~= "" then
+    local candidate = arg[-1]
+    if not candidate:find("[%s%(%)%;]") then
+      return candidate
+    end
+  end
+
+  -- Fall back to probing common binary names.
+  local candidates = { "lua", "lua5.4", "lua5.3", "lua5.2", "lua5.1", "luajit" }
+  for _, name in ipairs(candidates) do
+    local ok = os.execute(name .. " -e 'os.exit(0)' >/dev/null 2>&1")
+    -- os.execute returns true (Lua 5.2+) or 0 (Lua 5.1) on success.
+    if ok == true or ok == 0 then
+      return name
+    end
+  end
+
+  return nil  -- will cause run_tests to return an error
+end)()
+
+--- Probe for a timeout command (GNU coreutils).
+--- macOS ships without one; Homebrew provides `gtimeout`.
+local TIMEOUT_BIN = (function()
+  for _, name in ipairs({ "timeout", "gtimeout" }) do
+    local ok = os.execute(name .. " 0 true >/dev/null 2>&1")
+    if ok == true or ok == 0 then
+      return name
+    end
+  end
+  return nil  -- timeout enforcement will be skipped
+end)()
+
+-- ---------------------------------------------------------------------------
 -- skill_runner.run_tests
 -- ---------------------------------------------------------------------------
 
 --- Execute a test file as a subprocess and capture the results.
 ---
---- Runs: timeout <seconds> lua <test_file_path> -o json 2>&1
---- Parses stdout as plain text (one line per test status).
+--- If a GNU-compatible timeout(1) binary is available, it is used for
+--- wall-clock enforcement.  Otherwise the subprocess runs unguarded.
 ---
 --- @param test_file_path   string  path to the *_test.lua file
 --- @param timeout_seconds  number  maximum wall-clock seconds (default 60)
---- @return table|nil   { exit_code, output, passed }
+--- @return table|nil   { exit_code, output, passed, timed_out }
 --- @return string|nil  error message
 function M.run_tests(test_file_path, timeout_seconds)
   if type(test_file_path) ~= "string" or test_file_path == "" then
@@ -166,13 +209,26 @@ function M.run_tests(test_file_path, timeout_seconds)
     return nil, "skill_runner.run_tests: timeout_seconds must be a positive number"
   end
 
-  -- Build the command. Use timeout(1) for wall-clock enforcement.
-  -- Redirect stderr to stdout so we capture everything.
-  local cmd = string.format(
-    "timeout %d lua %s 2>&1",
-    math.ceil(timeout_seconds),
-    test_file_path
-  )
+  if not LUA_BIN then
+    return nil, "skill_runner.run_tests: no Lua interpreter found on PATH"
+  end
+
+  -- Shell-quote the file path (basic: wrap in single quotes, escape inner ')
+  local safe_path = "'" .. test_file_path:gsub("'", "'\\''") .. "'"
+
+  -- Build command with optional timeout prefix.
+  local cmd
+  if TIMEOUT_BIN then
+    cmd = string.format(
+      "%s %d %s %s 2>&1",
+      TIMEOUT_BIN,
+      math.ceil(timeout_seconds),
+      LUA_BIN,
+      safe_path
+    )
+  else
+    cmd = string.format("%s %s 2>&1", LUA_BIN, safe_path)
+  end
 
   local handle = io.popen(cmd, "r")
   if not handle then
@@ -182,7 +238,7 @@ function M.run_tests(test_file_path, timeout_seconds)
   local output = handle:read("*a")
   local ok, exit_type, exit_code = handle:close()
 
-  -- io.popen:close returns (true/nil, "exit"/"signal", code) in Lua 5.2+
+  -- io.popen:close returns (true/nil, "exit"/"signal", code) in Lua 5.2+.
   -- In Lua 5.1 it returns just the exit status number.
   if type(ok) == "number" then
     exit_code = ok
@@ -191,7 +247,7 @@ function M.run_tests(test_file_path, timeout_seconds)
     exit_code = exit_code or (ok and 0 or 1)
   end
 
-  -- timeout(1) returns exit code 124 when the process is killed.
+  -- timeout(1) / gtimeout returns exit code 124 when the process is killed.
   local timed_out = (exit_code == 124)
 
   return {

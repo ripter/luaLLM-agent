@@ -326,7 +326,18 @@ describe("skill_runner.run_tests", function()
     assert.is_truthy(result.output:find("something failed", 1, true))
   end)
 
-  it("times out on a hanging test", function()
+  it("times out on a hanging test (requires timeout/gtimeout)", function()
+    -- Probe for a timeout binary; skip gracefully if unavailable.
+    local has_timeout = false
+    for _, name in ipairs({ "timeout", "gtimeout" }) do
+      local ok = os.execute(name .. " 0 true >/dev/null 2>&1")
+      if ok == true or ok == 0 then has_timeout = true; break end
+    end
+    if not has_timeout then
+      pending("no timeout/gtimeout binary available — skipping")
+      return
+    end
+
     local runner = fresh_require("skill_runner")
     local result, err = runner.run_tests(TEST_DIR .. "/tests/hang.lua", 2)
     assert.is_truthy(result, tostring(err))

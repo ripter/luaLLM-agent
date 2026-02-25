@@ -59,6 +59,10 @@ end
 -- Public API
 -- ---------------------------------------------------------------------------
 
+function M.dir()
+  return state_dir
+end
+
 function M.init(dir)
   if not dir then
     error("state.init() requires a directory path")

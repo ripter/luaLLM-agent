@@ -284,7 +284,7 @@ Requirements:
 Use lfs for directory scanning. Use cjson.safe only if needed. Follow same module style as context files.
 ```
 
-### Step 1B.8 — Skill runner (`src/skill_runner.lua`)
+### ✅  Step 1B.8 — Skill runner (`src/skill_runner.lua`) (done)
 
 **Context files**: `src/sandbox.lua`, `src/skill_loader.lua`, `src/audit.lua`, `src/config.lua`
 
@@ -300,7 +300,7 @@ Requirements:
 Follow same module style as context files.
 ```
 
-### Step 1B.9 — Approval manager (`src/approval.lua`)
+###  ✅  Step 1B.9 — Approval manager (`src/approval.lua`) (done)
 
 **Context files**: `src/config.lua`, `src/audit.lua`, `src/state.lua`
 

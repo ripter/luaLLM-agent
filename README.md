@@ -6,13 +6,14 @@ A Lua-based agent built on top of luaLLM.
 
 ## Requirements
 
+* **coreutils**
+```bash
+brew install coreutils
+```
+
 * **Lua 5.4**
 * **LuaRocks**
-* Required rocks:
 
-  * `lua-cjson`
-  * `luafilesystem`
-  * `uuid`
 
 ---
 
