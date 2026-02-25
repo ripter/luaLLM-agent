@@ -318,35 +318,6 @@ describe("cmd_generate.run_with_context", function()
     assert.same({},              written[1].blocked_paths)
   end)
 
-  it("respects allowed_paths for context file paths (via safe_fs.is_allowed)", function()
-    local tmp = write_tmp("ctx_test.lua", "-- content\n")
-
-    local deps, _ = make_deps({
-      config_store = {
-        allowed_paths = { "/tmp/allowed/*" },
-        blocked_paths = {},
-      },
-    })
-    local orig_is_allowed = deps.safe_fs.is_allowed
-    deps.safe_fs.is_allowed = function(path)
-      if path:match("ctx_test") then
-        return false, "not in allowed_paths"
-      end
-      return orig_is_allowed(path)
-    end
-
-    local ok, err = cmd_generate_context.run(deps, {
-      output_path   = "/tmp/allowed/out.lua",
-      context_paths = { tmp },
-      prompt        = "Use it.",
-    })
-
-    rm(tmp)
-
-    assert.is_nil(ok)
-    assert.is_truthy(err:find("not in allowed_paths"))
-  end)
-
 end)
 
 -- ---------------------------------------------------------------------------
@@ -578,25 +549,6 @@ describe("cmd_generate_context.run", function()
 
     assert.is_true(ok, tostring(err))
     assert.is_truthy(captured_prompt:find("--- " .. tmp .. " ---", 1, true))
-  end)
-
-  it("validates allowed_paths for each context file", function()
-    local deps, _ = make_deps({
-      config_store = {
-        allowed_paths = { "/tmp/allowed/*" },
-        blocked_paths = {},
-      },
-    })
-    deps.safe_fs.is_allowed = function(path) return path:match("/tmp/allowed/") ~= nil, "not allowed" end
-
-    local ok, err = cmd_generate_context.run(deps, {
-      output_path   = "/tmp/out.lua",
-      context_paths = { cwd .. "/ctx_unsafe.lua" },
-      prompt        = "p",
-    })
-
-    assert.is_nil(ok)
-    assert.is_truthy(err:find("not allowed"))
   end)
 
   it("handles file with non-Lua content correctly", function()

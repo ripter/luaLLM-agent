@@ -104,7 +104,7 @@ lua main.lua test
 # 5. Fix issues (manual or re-generate with feedback)
 ```
 
-### Step 1B.1 — Audit logger (`src/audit.lua`)
+###  ✅  Step 1B.1 — Audit logger (`src/audit.lua`) (done)
 
 **Context files**: `src/config.lua`
 
@@ -125,7 +125,7 @@ Requirements:
 Follow the same module style as the context files: local M = {} at top, return M at bottom.
 ```
 
-### Step 1B.2 — UUID utility (`src/uuid.lua`)
+### ⏸️ Step 1B.2 — UUID utility (`src/uuid.lua`) (skipped)
 
 **Context files**: none (or skip entirely if using luarocks `uuid`)
 
@@ -140,7 +140,7 @@ Write a tiny Lua module uuid.lua that wraps the luarocks uuid library.
 - That's it. Keep it minimal.
 ```
 
-### Step 1B.3 — State manager (`src/state.lua`)
+### ✅  Step 1B.3 — State manager (`src/state.lua`) (done)
 
 **Context files**: `src/config.lua`
 
@@ -160,7 +160,7 @@ Requirements:
 Follow the same module style as the context files.
 ```
 
-### Step 1B.4 — Test framework (`src/test_framework.lua`)
+### ⏸️ Step 1B.4 — Test framework (`src/test_framework.lua`) (busted)
 
 **Context files**: `src/config_test.lua` (as an example of the inline harness being used now)
 
@@ -189,7 +189,7 @@ Follow the same module style as context files. Use cjson.safe for JSON output.
 
 After this step, refactor existing test files to use `require("test_framework")` instead of the inline harness.
 
-### Step 1B.5 — Task graph engine (`src/graph.lua`)
+### ✅  Step 1B.5 — Task graph engine (`src/graph.lua`) (done)
 
 **Context files**: `src/config.lua`, `src/state.lua`
 
@@ -219,7 +219,7 @@ Requirements:
 Use cjson.safe for JSON parsing. Follow the same module style as context files.
 ```
 
-### Step 1B.6 — Sandbox (`src/sandbox.lua`)
+### ✅  Step 1B.6 — Sandbox (`src/sandbox.lua`) (done)
 
 **Context files**: `src/config.lua`, `src/audit.lua`
 
@@ -256,7 +256,7 @@ Requirements:
 Use lfs for path resolution. Follow the same module style as context files.
 ```
 
-### Step 1B.7 — Skill loader (`src/skill_loader.lua`)
+### ✅  Step 1B.7 — Skill loader (`src/skill_loader.lua`) (done)
 
 **Context files**: `src/config.lua`, `src/sandbox.lua`
 
