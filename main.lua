@@ -136,12 +136,19 @@ local function run_quick_prompt(args)
 
   if not content then
     print("")
-    print(co("%{red}", "  ✗ " .. tostring(err_or_info)))
-    print(co("%{dim}", "    Is luallm running? Try: lua main.lua doctor"))
+    -- err_or_info may be a multiline error string — print each line indented.
+    for line in (tostring(err_or_info) .. "\n"):gmatch("([^\n]*)\n") do
+      if line ~= "" then
+        print(co("%{red}", "  ✗ ") .. line)
+      end
+    end
     print("")
     os.exit(1)
   end
 
+  if err_or_info.started then
+    io.write(co("%{dim}", "  (auto-started luallm)\n"))
+  end
   io.write(co("%{dim}", "  model: " .. err_or_info.model .. "  …") .. "\n")
   print("")
   print(content)

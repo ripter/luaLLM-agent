@@ -156,14 +156,18 @@ function M.resolve_model(state)
     end
   end
 
-  -- 3. last_used fallback — look up its port in the servers list.
+  -- 3. last_used fallback — only if it is actually running.
+  -- We deliberately do NOT fall back to a stopped/loading last_used model:
+  -- attempting complete() against a non-running model produces a confusing
+  -- "connection refused" error rather than a clear "no model running" message.
   if type(state.last_used) == "string" and state.last_used ~= "" then
     for _, entry in ipairs(get_servers(state)) do
-      if (entry.model or entry.name) == state.last_used and entry.port then
+      if (entry.model or entry.name) == state.last_used
+         and entry.state == "running"
+         and entry.port then
         return state.last_used, math.floor(entry.port)
       end
     end
-    return state.last_used, nil
   end
 
   return nil, nil
@@ -241,6 +245,22 @@ function M.complete(model_name, messages, options, port)
   end
 
   return decoded, nil
+end
+
+--- Start the luallm server.
+--- When model_name is provided, starts that specific model; otherwise starts
+--- the default (luallm picks it).
+--- Returns (true) on success or (nil, error_string) on failure.
+function M.start(model_name)
+  local args = { "start" }
+  if type(model_name) == "string" and model_name ~= "" then
+    args[#args + 1] = model_name
+  end
+  local result, err = M.exec(table.unpack(args))
+  if not result then
+    return nil, "luallm start failed: " .. tostring(err)
+  end
+  return true
 end
 
 return M

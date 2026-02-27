@@ -371,3 +371,150 @@ describe("luallm.complete", function()
   end)
 
 end)
+
+-- ---------------------------------------------------------------------------
+-- Tests: luallm.resolve_model
+-- ---------------------------------------------------------------------------
+
+describe("luallm.resolve_model", function()
+
+  it("returns first running server when no config model", function()
+    local state = {
+      servers = {
+        { model = "stopped", port = 8080, state = "stopped" },
+        { model = "live",    port = 8081, state = "running" },
+      },
+    }
+    local model, port = luallm.resolve_model(state)
+    assert.equals("live", model)
+    assert.equals(8081,   port)
+  end)
+
+  it("skips non-running servers, picks first running", function()
+    local state = {
+      servers = {
+        { model = "a", port = 8080, state = "loading" },
+        { model = "b", port = 8081, state = "running" },
+        { model = "c", port = 8082, state = "running" },
+      },
+    }
+    local model, _ = luallm.resolve_model(state)
+    assert.equals("b", model)
+  end)
+
+  it("falls back to last_used when it IS running", function()
+    local state = {
+      servers   = { { model = "last", port = 9000, state = "running" } },
+      last_used = "last",
+    }
+    local model, port = luallm.resolve_model(state)
+    assert.equals("last", model)
+    assert.equals(9000,   port)
+  end)
+
+  it("returns nil when last_used model is stopped (avoids connection refused)", function()
+    local state = {
+      servers   = { { model = "last", port = 9000, state = "stopped" } },
+      last_used = "last",
+    }
+    local model, port = luallm.resolve_model(state)
+    assert.is_nil(model)
+    assert.is_nil(port)
+  end)
+
+  it("returns nil when last_used has no port entry in servers", function()
+    local state = {
+      servers   = {},
+      last_used = "ghost-model",
+    }
+    local model, port = luallm.resolve_model(state)
+    assert.is_nil(model)
+    assert.is_nil(port)
+  end)
+
+  it("returns nil, nil when state has no servers and no last_used", function()
+    local model, port = luallm.resolve_model({ servers = {} })
+    assert.is_nil(model)
+    assert.is_nil(port)
+  end)
+
+  it("handles state.models shape (entry.name field)", function()
+    local state = {
+      models = { { name = "via-models", port = 7777, state = "running" } },
+    }
+    local model, port = luallm.resolve_model(state)
+    assert.equals("via-models", model)
+    assert.equals(7777, port)
+  end)
+
+  it("handles state.running_models shape", function()
+    local state = {
+      running_models = { { name = "rm-model", port = 6666, state = "running" } },
+    }
+    local model, port = luallm.resolve_model(state)
+    assert.equals("rm-model", model)
+    assert.equals(6666, port)
+  end)
+
+end)
+
+-- ---------------------------------------------------------------------------
+-- Tests: luallm.start
+-- ---------------------------------------------------------------------------
+
+describe("luallm.start", function()
+
+  local restore_exec
+
+  after_each(function()
+    if restore_exec then restore_exec(); restore_exec = nil end
+  end)
+
+  it("calls exec with 'start' as the first argument", function()
+    local called_with = {}
+    restore_exec = stub(luallm, "exec", function(...)
+      called_with = { ... }
+      return { status = "ok" }, nil
+    end)
+
+    local ok, err = luallm.start()
+    assert.is_true(ok)
+    assert.is_nil(err)
+    assert.equals("start", called_with[1])
+  end)
+
+  it("passes model_name as second argument when provided", function()
+    local called_with = {}
+    restore_exec = stub(luallm, "exec", function(...)
+      called_with = { ... }
+      return { status = "ok" }, nil
+    end)
+
+    luallm.start("llama3")
+    assert.equals("start",  called_with[1])
+    assert.equals("llama3", called_with[2])
+  end)
+
+  it("does not pass extra arguments when model_name is nil", function()
+    local called_with = {}
+    restore_exec = stub(luallm, "exec", function(...)
+      called_with = { ... }
+      return { status = "ok" }, nil
+    end)
+
+    luallm.start()
+    assert.equals("start", called_with[1])
+    assert.is_nil(called_with[2])
+  end)
+
+  it("returns (nil, err) when exec fails", function()
+    restore_exec = stub(luallm, "exec", function(...)
+      return nil, "binary not found"
+    end)
+
+    local ok, err = luallm.start()
+    assert.is_nil(ok)
+    assert.is_truthy(err:find("binary not found", 1, true))
+  end)
+
+end)
