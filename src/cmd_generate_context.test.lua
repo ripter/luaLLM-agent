@@ -1,7 +1,8 @@
+local mocks = require("test.mocks")
 local lfs = require("lfs")
 
-local _src = debug.getinfo(1, "S").source:match("^@(.*/)") or "./"
-package.path = _src .. "?.lua;" .. package.path
+--local _src = debug.getinfo(1, "S").source:match("^@(.*/)") or "./"
+--package.path = _src .. "?.lua;" .. package.path
 
 local cmd_generate         = require("cmd_generate")
 local cmd_generate_context = require("cmd_generate_context")
@@ -12,12 +13,7 @@ local cmd_generate_context = require("cmd_generate_context")
 
 local cwd = lfs.currentdir()
 
-local function fake_response(content, usage)
-  return {
-    choices = { { message = { role = "assistant", content = content } } },
-    usage   = usage,
-  }
-end
+
 
 --- Build a minimal deps table for cmd_generate / cmd_generate_context.
 local function make_deps(overrides)
@@ -37,7 +33,7 @@ local function make_deps(overrides)
   local state_resp = overrides.state_resp or {
     servers = { { model = "ctx-model", port = 8080, state = "running" } }
   }
-  local complete_resp = overrides.complete_resp or fake_response("-- generated\n")
+  local complete_resp = overrides.complete_resp or mocks.fake_response("-- generated\n")
   local complete_err  = overrides.complete_err
 
   local luallm = {
@@ -48,6 +44,9 @@ local function make_deps(overrides)
     complete = function(model, messages, options, port)
       if complete_err then return nil, complete_err end
       return complete_resp, nil
+    end,
+    resolve_model = overrides.resolve_model or function()
+      return overrides.model or "test-model", overrides.port
     end,
   }
 
@@ -168,8 +167,10 @@ describe("cmd_generate.run_with_context", function()
 
   it("calls run_inner with the assembled context prompt", function()
     local captured_prompt
-    local deps, _ = make_deps({
-      config_store = { allowed_paths = { "/tmp/*" }, blocked_paths = {} },
+    local deps, _ = mocks.make_deps({
+      config_overrides = {
+        store = { allowed_paths = { "/tmp/*" }, blocked_paths = {} },
+      }
     })
     local orig_complete = deps.luallm.complete
     deps.luallm.complete = function(model, messages, options, port)
@@ -190,12 +191,14 @@ describe("cmd_generate.run_with_context", function()
 
   it("empty context_files sends prompt with header but no file blocks", function()
     local captured_prompt
-    local deps, _ = make_deps({
-      config_store = { allowed_paths = { "/tmp/*" }, blocked_paths = {} },
+    local deps, _ = mocks.make_deps({
+      config_overrides = {
+        store = { allowed_paths = { "/tmp/*" }, blocked_paths = {} },
+      }
     })
     deps.luallm.complete = function(model, messages, options, port)
       captured_prompt = messages[2].content
-      return fake_response("x=1\n"), nil
+      return mocks.fake_response("x=1\n"), nil
     end
 
     cmd_generate.run_with_context(deps, {
@@ -209,9 +212,13 @@ describe("cmd_generate.run_with_context", function()
   end)
 
   it("propagates write failure from run_inner", function()
-    local deps, _ = make_deps({
-      config_store = { allowed_paths = { "/tmp/*" }, blocked_paths = {} },
-      write_err    = "disk full",
+    local deps, _ = mocks.make_deps({
+      config_overrides = {
+        store = { allowed_paths = { "/tmp/*" }, blocked_paths = {} },
+      },
+      safe_fs_overrides = {
+        write_err = "disk full",
+      },
     })
 
     local ok, err = cmd_generate.run_with_context(deps, {
@@ -225,9 +232,14 @@ describe("cmd_generate.run_with_context", function()
   end)
 
   it("returns info table with model and tokens on success", function()
-    local deps, _ = make_deps({
-      config_store  = { allowed_paths = { "/tmp/*" }, blocked_paths = {} },
-      complete_resp = fake_response("x=1\n", { total_tokens = 99 }),
+    local deps, _ = mocks.make_deps({
+      config_overrides = {
+        store = { allowed_paths = { "/tmp/*" }, blocked_paths = {} },
+      },
+      luallm_overrides = {
+        model         = "ctx-model",
+        complete_resp = mocks.fake_response("x=1\n", { total_tokens = 99 }),
+      },
     })
 
     local ok, info = cmd_generate.run_with_context(deps, {
@@ -242,9 +254,14 @@ describe("cmd_generate.run_with_context", function()
   end)
 
   it("returns info even when usage field is missing", function()
-    local deps, _ = make_deps({
-      config_store  = { allowed_paths = { "/tmp/*" }, blocked_paths = {} },
-      complete_resp = { choices = { { message = { role = "assistant", content = "x=1\n" } } } },
+    local deps, _ = mocks.make_deps({
+      config_overrides = {
+        store = { allowed_paths = { "/tmp/*" }, blocked_paths = {} },
+      },
+      luallm_overrides = {
+        model         = "ctx-model",
+        complete_resp = mocks.fake_response("x=1\n"),
+      },
     })
 
     local ok, info = cmd_generate.run_with_context(deps, {
@@ -260,8 +277,10 @@ describe("cmd_generate.run_with_context", function()
 
   it("delegates write_file to safe_fs with correct args", function()
     local captured_user_msg
-    local deps, written = make_deps({
-      config_store = { allowed_paths = { "/allowed/*" }, blocked_paths = { "/denied/*" } },
+    local deps, written = mocks.make_deps({
+      config_overrides = {
+        store = { allowed_paths = { "/allowed/*" }, blocked_paths = { "/denied/*" } },
+      }
     })
     local orig_complete = deps.luallm.complete
     deps.luallm.complete = function(model, messages, options, port)
@@ -283,8 +302,10 @@ describe("cmd_generate.run_with_context", function()
   end)
 
   it("propagates safe_fs.write_file denial error", function()
-    local deps, written = make_deps({
-      config_store = { allowed_paths = { "/allowed/*" }, blocked_paths = {} },
+    local deps, written = mocks.make_deps({
+      config_overrides = {
+        store = { allowed_paths = { "/allowed/*" }, blocked_paths = {} },
+      }
     })
     deps.safe_fs.write_file = function(path, content, allowed_paths, blocked_paths)
       -- Still record for assertion B
@@ -330,13 +351,21 @@ describe("cmd_generate_context.run", function()
     local tmp = write_tmp("ctx_test_file.lua", "-- real content\n")
     local captured_prompt
 
-    local deps, _ = make_deps({
-      config_store = { allowed_paths = { "/tmp/*" }, blocked_paths = {} },
+    local deps = mocks.make_deps({
+      config_overrides = {
+        store = { allowed_paths = { "/tmp/*" }, blocked_paths = {} },
+      },
+      luallm_overrides = {
+        complete = function(model, messages, options, port)
+          captured_prompt = messages[2].content
+          return mocks.fake_response("x=1\n"), nil
+        end
+      },
     })
-    deps.luallm.complete = function(model, messages, options, port)
-      captured_prompt = messages[2].content
-      return fake_response("x=1\n"), nil
-    end
+    --deps.luallm.complete = function(model, messages, options, port)
+    --  captured_prompt = messages[2].content
+    --  return fake_response("x=1\n"), nil
+    --end
 
     local ok, err = cmd_generate_context.run(deps, {
       output_path   = "/tmp/out.lua",
@@ -354,13 +383,21 @@ describe("cmd_generate_context.run", function()
     local tmp = write_tmp("labelled.lua", "x=1\n")
     local captured_prompt
 
-    local deps, _ = make_deps({
-      config_store = { allowed_paths = { "/tmp/*" }, blocked_paths = {} },
+    local deps = mocks.make_deps({
+      config_overrides = {
+        store = { allowed_paths = { "/tmp/*" }, blocked_paths = {} },
+      },
+      luallm_overrides = {
+        complete = function(model, messages, options, port)
+          captured_prompt = messages[2].content
+          return mocks.fake_response("y=2\n"), nil
+        end
+      },
     })
-    deps.luallm.complete = function(model, messages, options, port)
-      captured_prompt = messages[2].content
-      return fake_response("y=2\n"), nil
-    end
+    --deps.luallm.complete = function(model, messages, options, port)
+    --  captured_prompt = messages[2].content
+    --  return fake_response("y=2\n"), nil
+    --end
 
     cmd_generate_context.run(deps, {
       output_path   = "/tmp/out.lua",
@@ -377,13 +414,21 @@ describe("cmd_generate_context.run", function()
     local tmp2 = write_tmp("ctx_second.lua", "-- second\n")
     local captured_prompt
 
-    local deps, _ = make_deps({
-      config_store = { allowed_paths = { "/tmp/*" }, blocked_paths = {} },
+    local deps = mocks.make_deps({
+      config_overrides = {
+        store = { allowed_paths = { "/tmp/*" }, blocked_paths = {} },
+      },
+      luallm_overrides = {
+        complete = function(model, messages, options, port)
+          captured_prompt = messages[2].content
+          return mocks.fake_response("z=3\n"), nil
+        end
+      },
     })
-    deps.luallm.complete = function(model, messages, options, port)
-      captured_prompt = messages[2].content
-      return fake_response("z=3\n"), nil
-    end
+    --deps.luallm.complete = function(model, messages, options, port)
+    --  captured_prompt = messages[2].content
+    --  return fake_response("z=3\n"), nil
+    --end
 
     cmd_generate_context.run(deps, {
       output_path   = "/tmp/out.lua",
@@ -401,8 +446,10 @@ describe("cmd_generate_context.run", function()
   end)
 
   it("returns an error when a context file does not exist", function()
-    local deps, written = make_deps({
-      config_store = { allowed_paths = { "/tmp/*" }, blocked_paths = {} },
+    local deps, written = mocks.make_deps({
+      config_overrides = {
+        store = { allowed_paths = { "/tmp/*" }, blocked_paths = {} },
+      },
     })
 
     local ok, err = cmd_generate_context.run(deps, {
@@ -421,11 +468,13 @@ describe("cmd_generate_context.run", function()
     local big_content = string.rep("x", 100)
     local tmp = write_tmp("ctx_big.lua", big_content)
 
-    local deps, written = make_deps({
-      config_store = {
-        allowed_paths                  = { "/tmp/*" },
-        blocked_paths                  = {},
-        ["generate.max_context_bytes"] = 50,  -- cap at 50 bytes
+    local deps, written = mocks.make_deps({
+      config_overrides = {
+        store = {
+          allowed_paths                  = { "/tmp/*" },
+          blocked_paths                  = {},
+          ["generate.max_context_bytes"] = 50,  -- cap at 50 bytes
+        },
       },
     })
 
@@ -443,7 +492,7 @@ describe("cmd_generate_context.run", function()
   end)
 
   it("returns error when no context files are provided", function()
-    local deps, _ = make_deps()
+    local deps = mocks.make_deps()
 
     local ok, err = cmd_generate_context.run(deps, {
       output_path   = "/tmp/out.lua",
@@ -458,9 +507,13 @@ describe("cmd_generate_context.run", function()
   it("passes through LLM errors from run_with_context", function()
     local tmp = write_tmp("ctx_err.lua", "-- src\n")
 
-    local deps, _ = make_deps({
-      config_store  = { allowed_paths = { "/tmp/*" }, blocked_paths = {} },
-      complete_err  = "timeout",
+    local deps, _ = mocks.make_deps({
+      config_overrides = {
+        config_store  = { allowed_paths = { "/tmp/*" }, blocked_paths = {} },
+      },
+      luallm_overrides = {
+        complete_err  = "timeout",
+      },
     })
 
     local ok, err = cmd_generate_context.run(deps, {
@@ -481,11 +534,13 @@ describe("cmd_generate_context.run", function()
     local tmp1    = write_tmp("ctx_cum1.lua", content)
     local tmp2    = write_tmp("ctx_cum2.lua", content)
 
-    local deps, written = make_deps({
-      config_store = {
-        allowed_paths                  = { "/tmp/*" },
-        blocked_paths                  = {},
-        ["generate.max_context_bytes"] = 60,
+    local deps, written = mocks.make_deps({
+      config_overrides = {
+        store = {
+          allowed_paths                  = { "/tmp/*" },
+          blocked_paths                  = {},
+          ["generate.max_context_bytes"] = 60,
+        },
       },
     })
 
@@ -507,11 +562,13 @@ describe("cmd_generate_context.run", function()
     local content = string.rep("a", 80)
     local tmp     = write_tmp("ctx_override.lua", content)
 
-    local deps, written = make_deps({
-      config_store = {
-        allowed_paths                  = { "/tmp/*" },
-        blocked_paths                  = {},
-        ["generate.max_context_bytes"] = 100,
+    local deps, written = mocks.make_deps({
+      config_override = {
+        store = {
+          allowed_paths                  = { "/tmp/*" },
+          blocked_paths                  = {},
+          ["generate.max_context_bytes"] = 100,
+        },
       },
     })
 
@@ -530,14 +587,22 @@ describe("cmd_generate_context.run", function()
   it("handles empty files gracefully", function()
     local tmp = write_tmp("ctx_empty.lua", "")
 
-    local deps, _ = make_deps({
-      config_store = { allowed_paths = { "/tmp/*" }, blocked_paths = {} },
-    })
     local captured_prompt
-    deps.luallm.complete = function(model, messages, options, port)
-      captured_prompt = messages[2].content
-      return fake_response("done\n"), nil
-    end
+    local deps = mocks.make_deps({
+      config_overrides = {
+        store = { allowed_paths = { "/tmp/*" }, blocked_paths = {} },
+      },
+      luallm_overrides = {
+        complete = function(model, messages, options, port)
+          captured_prompt = messages[2].content
+          return mocks.fake_response("done\n"), nil
+        end,
+      },
+    })
+    --deps.luallm.complete = function(model, messages, options, port)
+    --  captured_prompt = messages[2].content
+    --  return fake_response("done\n"), nil
+    --end
 
     local ok, err = cmd_generate_context.run(deps, {
       output_path   = "/tmp/out.lua",
@@ -555,14 +620,22 @@ describe("cmd_generate_context.run", function()
     local content = "This is not code\nBut should be included anyway"
     local tmp = write_tmp("ctx_text.txt", content)
 
-    local deps, _ = make_deps({
-      config_store = { allowed_paths = { "/tmp/*" }, blocked_paths = {} },
-    })
     local captured_prompt
-    deps.luallm.complete = function(model, messages, options, port)
-      captured_prompt = messages[2].content
-      return fake_response("done\n"), nil
-    end
+    local deps = mocks.make_deps({
+      config_override = {
+        store = { allowed_paths = { "/tmp/*" }, blocked_paths = {} },
+      },
+      luallm_overrides = {
+        complete = function(model, messages, options, port)
+          captured_prompt = messages[2].content
+          return mocks.fake_response("done\n"), nil
+        end,
+      },
+    })
+    --deps.luallm.complete = function(model, messages, options, port)
+    --  captured_prompt = messages[2].content
+    --  return fake_response("done\n"), nil
+    --end
 
     local ok, err = cmd_generate_context.run(deps, {
       output_path   = "/tmp/out.lua",
@@ -584,11 +657,13 @@ describe("cmd_generate_context.run", function()
     local tmp1    = write_tmp("ctx_exact50.lua", content)
     local tmp2    = write_tmp("ctx_extra1.lua",  "y")
 
-    local deps, written = make_deps({
-      config_store = {
-        allowed_paths                  = { "/tmp/*" },
-        blocked_paths                  = {},
-        ["generate.max_context_bytes"] = 50,
+    local deps, written = mocks.make_deps({
+      config_overrides = {
+        store = {
+          allowed_paths                  = { "/tmp/*" },
+          blocked_paths                  = {},
+          ["generate.max_context_bytes"] = 50,
+        },
       },
     })
 

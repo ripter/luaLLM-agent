@@ -7,24 +7,16 @@ local http  = require("socket.http")
 local ltn12 = require("ltn12")
 
 -- Ensure sibling modules in src/ are findable regardless of working directory.
-local _src = debug.getinfo(1, "S").source:match("^@(.*/)") or "./"
+local _src = debug.getinfo(1, "S").source:match("^@(.*/)" ) or "./"
 package.path = _src .. "?.lua;" .. package.path
 
--- Config is loaded lazily so this module can be required before config.load().
 local config = require("config")
 
 local M = {}
 
--- Fallback binary name if config is unavailable.
 local DEFAULT_BINARY = "luallm"
-
--- Truncation limit for error response bodies.
 local MAX_BODY_IN_ERR = 2048
 
--- LLM inference can be slow — especially for large context payloads.
--- Override luasocket's default 60s with limits.llm_timeout_seconds (default 300s).
--- complete() also accepts options._timeout to allow per-call overrides without
--- touching the global config (used by generate commands for longer tasks).
 local function get_timeout(override)
   if type(override) == "number" and override > 0 then
     return override
@@ -40,13 +32,11 @@ end
 -- Internal helpers
 -- ---------------------------------------------------------------------------
 
---- Return the luallm binary path, loading config lazily if needed.
 local function get_binary()
   local ok, val = pcall(config.get, "luallm.binary")
   if ok and type(val) == "string" and val ~= "" then
     return val
   end
-  -- Config not loaded yet — try to load with default path.
   config.load()
   local ok2, val2 = pcall(config.get, "luallm.binary")
   if ok2 and type(val2) == "string" and val2 ~= "" then
@@ -55,17 +45,14 @@ local function get_binary()
   return DEFAULT_BINARY
 end
 
---- Build a shell-safe quoted argument string from a list of strings.
 local function build_cmd(binary, args)
   local parts = { binary }
   for _, a in ipairs(args) do
-    -- Wrap each arg in single-quotes, escaping any single-quotes inside.
     parts[#parts + 1] = "'" .. tostring(a):gsub("'", "'\\''") .. "'"
   end
   return table.concat(parts, " ")
 end
 
---- Return true if the args list already contains "--json".
 local function has_json_flag(args)
   for _, a in ipairs(args) do
     if a == "--json" then return true end
@@ -74,11 +61,6 @@ local function has_json_flag(args)
 end
 
 --- Return the list of server entries from a status response.
---- Tolerates several shapes:
----   { servers = [...] }         actual luallm shape, entry.model = name
----   { models = [...] }          entry.name = name
----   { running_models = [...] }  entry.name = name
----   bare array                  entry.name = name
 local function get_servers(state)
   return state.servers
       or state.models
@@ -87,13 +69,12 @@ local function get_servers(state)
       or {}
 end
 
---- Extract the model name from a server entry (handles both .model and .name).
+--- Extract the model name from a server entry.
 local function entry_name(entry)
   return entry.model or entry.name
 end
 
---- Locate a server entry matching model_name (checks all entries, any state).
---- Returns the matching entry table, or nil.
+--- Locate a server entry matching model_name.
 local function find_model(state, model_name)
   for _, entry in ipairs(get_servers(state)) do
     if entry_name(entry) == model_name then
@@ -107,8 +88,6 @@ end
 -- Public API
 -- ---------------------------------------------------------------------------
 
---- Run `<binary> <args...> --json` and return the decoded JSON response.
---- Returns (table, nil) on success or (nil, error_string) on failure.
 function M.exec(...)
   local args = { ... }
 
@@ -141,14 +120,10 @@ function M.exec(...)
   return decoded, nil
 end
 
---- Run `luallm status --json` and return the decoded state table.
---- Returns (table, nil) or (nil, error_string).
 function M.state()
   return M.exec("status")
 end
 
---- Return the name of the first model with state == "running", or (nil, err).
---- Useful when no specific model name is known.
 function M.first_model()
   local state, err = M.state()
   if not state then
@@ -163,18 +138,41 @@ function M.first_model()
   return nil, "no running models found in luallm status"
 end
 
---- Send a chat completion request to the running model.
----
---- @param model_name  string   Model to target (must appear in luallm state).
---- @param messages    table    Array of { role=..., content=... } messages.
---- @param options     table?   Optional extra fields merged into the request body.
---- @param port        number?  If provided, skips the luallm status call entirely.
---- Returns (table, nil) on success or (nil, error_string) on failure.
+--- Pick the best model+port from a status response.
+--- Priority: config luallm.model > first running server > state.last_used.
+--- Returns (model_name, port_or_nil).
+--- This is the SINGLE implementation — cmd_generate and cmd_quick both use it.
+function M.resolve_model(state)
+  -- 1. Config explicit model.
+  local cfg_ok, cfg_model = pcall(config.get, "luallm.model")
+  if cfg_ok and type(cfg_model) == "string" and cfg_model ~= "" then
+    return cfg_model, nil
+  end
+
+  -- 2. First running server.
+  for _, entry in ipairs(get_servers(state)) do
+    if entry.state == "running" and (entry.model or entry.name) and entry.port then
+      return entry.model or entry.name, math.floor(entry.port)
+    end
+  end
+
+  -- 3. last_used fallback — look up its port in the servers list.
+  if type(state.last_used) == "string" and state.last_used ~= "" then
+    for _, entry in ipairs(get_servers(state)) do
+      if (entry.model or entry.name) == state.last_used and entry.port then
+        return state.last_used, math.floor(entry.port)
+      end
+    end
+    return state.last_used, nil
+  end
+
+  return nil, nil
+end
+
 function M.complete(model_name, messages, options, port)
   if port then
     port = math.floor(port)
   else
-    -- Locate the model port via luallm state (one subprocess call).
     local state, state_err = M.state()
     if not state then
       return nil, "luallm.state() failed: " .. tostring(state_err)
@@ -191,9 +189,6 @@ function M.complete(model_name, messages, options, port)
     port = math.floor(entry.port)
   end
 
-  -- Build request payload.
-  -- options._timeout is a private per-call override, not an API field — extract
-  -- it before merging the rest of options into the payload.
   local timeout_override = nil
   local payload = { model = model_name, messages = messages }
   if type(options) == "table" then
@@ -213,9 +208,6 @@ function M.complete(model_name, messages, options, port)
 
   local url = "http://127.0.0.1:" .. port .. "/v1/chat/completions"
 
-  -- Apply timeout before the request. luasocket's http.TIMEOUT is checked
-  -- per-connection. We use a per-call override if provided, otherwise fall
-  -- back to config (limits.llm_timeout_seconds, default 300s).
   http.TIMEOUT = get_timeout(timeout_override)
   local resp_chunks = {}
   local result, status, resp_headers, status_line = http.request({
@@ -231,7 +223,6 @@ function M.complete(model_name, messages, options, port)
   })
 
   if not result then
-    -- luasocket returns nil + error string on connection failure.
     return nil, "HTTP request failed: " .. tostring(status)
   end
 

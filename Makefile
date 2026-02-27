@@ -4,8 +4,8 @@ LUAROCKS ?= luarocks
 LUA ?= lua
 
 # rock name → require() name
-ROCKS := lua-cjson luafilesystem uuid ansicolors argparse busted luasocket
-MODULES := cjson lfs uuid ansicolors argparse busted socket.http ltn12
+ROCKS := lua-cjson luafilesystem uuid ansicolors argparse busted luasocket penlight
+MODULES := cjson lfs uuid ansicolors argparse busted socket.http ltn12 pl
 
 help:
 	@echo "Targets:"

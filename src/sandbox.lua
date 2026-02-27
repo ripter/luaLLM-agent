@@ -2,7 +2,8 @@
 --- Execute untrusted Lua code in a restricted environment.
 --- Rocks: luafilesystem (lfs)
 
-local lfs = require("lfs")
+local lfs     = require("lfs")
+local safe_fs = require("safe_fs")
 
 local M = {}
 
@@ -12,14 +13,15 @@ local M = {}
 
 local MAX_OPEN_HANDLES     = 10
 local DEFAULT_TIMEOUT_SEC  = 30
-local INSTRUCTIONS_PER_SEC = 1000000   -- calibration: ~1 M instructions/sec
+local INSTRUCTIONS_PER_SEC = 1000000
 
 -- ---------------------------------------------------------------------------
 -- Helpers
 -- ---------------------------------------------------------------------------
 
 --- Resolve a path to an absolute, normalised form.
---- Collapses /./, /../, and resolves relative paths against lfs.currentdir().
+--- Unlike util.normalize, this does NOT expand ~ (sandboxed code must not
+--- know about $HOME). It only resolves relative paths and collapses . and ..
 local function resolve_path(path)
   if type(path) ~= "string" or path == "" then
     return nil, "path must be a non-empty string"
@@ -47,46 +49,26 @@ local function resolve_path(path)
   return "/" .. table.concat(parts, "/")
 end
 
---- Check whether resolved_path matches any entry in a list of path patterns.
---- Supports exact match, prefix match, and trailing-glob (/*) match.
-local function path_matches(resolved_path, patterns)
-  for _, pattern in ipairs(patterns or {}) do
-    local prefix = pattern:gsub("/%*$", "")
-    if resolved_path == prefix
-       or resolved_path:sub(1, #prefix + 1) == prefix .. "/" then
-      return true, pattern
-    end
-  end
-  return false
-end
-
 -- ---------------------------------------------------------------------------
 -- sandbox.make_io
 -- ---------------------------------------------------------------------------
 
---- Build a restricted io table whose open/lines/close respect declared and
---- allowed path lists. Tracks open handles and enforces a maximum count.
----
---- @param declared_paths  list of path patterns the skill declared
---- @param allowed_paths   list of globally allowed path patterns (from config)
---- @param log_fn          function(event, data) for audit logging
---- @param skill_name      string used as context in log entries
---- @return table  restricted io-like table
 function M.make_io(declared_paths, allowed_paths, log_fn, skill_name)
   local open_handles = 0
 
   --- Validate that a resolved path is permitted by both lists.
+  --- Uses safe_fs.prefix_match — the shared path matching implementation.
   local function check_path(path, mode)
     local resolved, err = resolve_path(path)
     if not resolved then
       return nil, "sandbox.io: invalid path: " .. tostring(err)
     end
 
-    if not path_matches(resolved, declared_paths) then
+    if not safe_fs.prefix_match(resolved, declared_paths) then
       return nil, "sandbox.io: path not in skill's declared paths: " .. resolved
     end
 
-    if not path_matches(resolved, allowed_paths) then
+    if not safe_fs.prefix_match(resolved, allowed_paths) then
       return nil, "sandbox.io: path not in global allowed_paths: " .. resolved
     end
 
@@ -103,10 +85,6 @@ function M.make_io(declared_paths, allowed_paths, log_fn, skill_name)
 
   local sio = {}
 
-  --- Open a file after path checks. Honours the handle limit.
-  --- @param path string
-  --- @param mode string|nil  (defaults to "r")
-  --- @return file handle or nil + error
   function sio.open(path, mode)
     mode = mode or "r"
 
@@ -126,9 +104,6 @@ function M.make_io(declared_paths, allowed_paths, log_fn, skill_name)
     return fh
   end
 
-  --- Return an iterator over lines of a file after path checks.
-  --- @param path string
-  --- @return iterator or nil + error
   function sio.lines(path)
     local resolved, err = check_path(path, "r")
     if not resolved then return nil, err end
@@ -143,7 +118,6 @@ function M.make_io(declared_paths, allowed_paths, log_fn, skill_name)
     end
 
     open_handles = open_handles + 1
-    -- io.lines auto-closes, so we wrap to track the decrement.
     local finished = false
     return function()
       local line = iter()
@@ -155,8 +129,6 @@ function M.make_io(declared_paths, allowed_paths, log_fn, skill_name)
     end
   end
 
-  --- Close a file handle and decrement the open count.
-  --- @param handle file handle
   function sio.close(handle)
     if handle then
       handle:close()
@@ -166,7 +138,6 @@ function M.make_io(declared_paths, allowed_paths, log_fn, skill_name)
     end
   end
 
-  --- Return the current number of open handles (for testing).
   function sio.open_count()
     return open_handles
   end
@@ -178,20 +149,12 @@ end
 -- sandbox.make_require
 -- ---------------------------------------------------------------------------
 
---- Build a restricted require function that only loads modules explicitly
---- listed in declared_deps, and only from allowed_dir.
----
---- @param declared_deps  list of module name strings the skill may require
---- @param allowed_dir    directory from which to load <modname>.lua files
---- @return function  restricted require replacement
 function M.make_require(declared_deps, allowed_dir)
-  -- Build a set for O(1) lookup.
   local dep_set = {}
   for _, name in ipairs(declared_deps or {}) do
     dep_set[name] = true
   end
 
-  -- Cache loaded modules to avoid re-executing.
   local module_cache = {}
 
   local function sandboxed_require(modname)
@@ -218,7 +181,6 @@ function M.make_require(declared_deps, allowed_dir)
       error("sandbox.require: failed to load '" .. filepath .. "': " .. tostring(load_err), 2)
     end
 
-    -- Run the loaded chunk in a minimal restricted env (recursive sandbox).
     local dep_env = M.make_env({
       paths         = {},
       allowed_paths = {},
@@ -228,10 +190,9 @@ function M.make_require(declared_deps, allowed_dir)
       skill_name    = modname,
     })
 
-    if setfenv then                -- Lua 5.1
+    if setfenv then
       setfenv(chunk, dep_env)
-    else                           -- Lua 5.2+
-      -- loadfile doesn't accept env in all builds; use debug.setupvalue
+    else
       debug.setupvalue(chunk, 1, dep_env)
     end
 
@@ -251,18 +212,6 @@ end
 -- sandbox.make_env
 -- ---------------------------------------------------------------------------
 
---- Build a restricted _ENV / environment table for untrusted code.
----
---- opts fields:
----   paths         – list of path patterns the skill may access
----   allowed_paths – global allowed paths from config
----   dependencies  – list of module names the skill may require
----   allowed_dir   – directory to load dependency modules from
----   log_fn        – function(event, data) for audit logging (may be nil)
----   skill_name    – string identifying the skill (for logs)
----
---- @param opts table
---- @return table  restricted environment
 function M.make_env(opts)
   opts = opts or {}
 
@@ -300,7 +249,7 @@ function M.make_env(opts)
       opts.allowed_dir  or "."
     ),
 
-    -- Captured print — collects output for inspection.
+    -- Captured print
     print = function(...)
       local parts = {}
       for i = 1, select("#", ...) do
@@ -309,15 +258,9 @@ function M.make_env(opts)
       captured_output[#captured_output + 1] = table.concat(parts, "\t")
     end,
 
-    -- Audit log function available to skill code.
     log = opts.log_fn,
-
-    -- Give code access to its captured output table.
     _captured_output = captured_output,
   }
-
-  -- Explicitly NOT in env: os, debug, load, loadstring, loadfile, dofile,
-  -- rawget, rawset, rawequal, collectgarbage, setfenv, getfenv, io (raw).
 
   return env
 end
@@ -326,13 +269,6 @@ end
 -- sandbox.execute
 -- ---------------------------------------------------------------------------
 
---- Load and execute a code string inside the given environment with a
---- CPU-time limit enforced via debug.sethook instruction counting.
----
---- @param code_string      string   Lua source to execute
---- @param env              table    environment table (from make_env)
---- @param timeout_seconds  number|nil  CPU budget in seconds (default 30)
---- @return true, result on success; nil, error_string on failure
 function M.execute(code_string, env, timeout_seconds)
   if type(code_string) ~= "string" then
     return nil, "sandbox.execute: code_string must be a string"
@@ -348,16 +284,13 @@ function M.execute(code_string, env, timeout_seconds)
 
   local max_instructions = math.floor(timeout_seconds * INSTRUCTIONS_PER_SEC)
 
-  -- Load the code chunk.
   local chunk, load_err
   if setfenv then
-    -- Lua 5.1: loadstring + setfenv
     chunk, load_err = loadstring(code_string, "=sandbox")
     if chunk then
       setfenv(chunk, env)
     end
   else
-    -- Lua 5.2+: load accepts env directly
     chunk, load_err = load(code_string, "=sandbox", "t", env)
   end
 
@@ -365,7 +298,6 @@ function M.execute(code_string, env, timeout_seconds)
     return nil, "sandbox.execute: compilation failed: " .. tostring(load_err)
   end
 
-  -- Instruction-count hook to enforce CPU timeout.
   local instruction_count = 0
   local timed_out = false
 
@@ -377,12 +309,10 @@ function M.execute(code_string, env, timeout_seconds)
     end
   end
 
-  -- Install hook: fire every 1000 instructions for reasonable granularity.
   debug.sethook(hook, "", 1000)
 
   local ok, result = pcall(chunk)
 
-  -- Always remove the hook.
   debug.sethook()
 
   if not ok then

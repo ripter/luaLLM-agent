@@ -1,12 +1,14 @@
 --- src/skill_runner.lua
 --- Execute skills inside the sandbox, run test suites, validate skills.
---- Depends on: sandbox, skill_loader, audit, config
+--- Depends on: sandbox, skill_loader, audit, config, safe_fs, util
 
 local sandbox      = require("sandbox")
 local skill_loader = require("skill_loader")
 local audit        = require("audit")
 local config       = require("config")
+local safe_fs      = require("safe_fs")
 local lfs          = require("lfs")
+local util         = require("util")
 
 local M = {}
 
@@ -14,52 +16,17 @@ local M = {}
 -- Helpers
 -- ---------------------------------------------------------------------------
 
---- Return current time as an ISO 8601 string (UTC, second precision).
-local function iso8601()
-  return os.date("!%Y-%m-%dT%H:%M:%SZ")
-end
-
 --- Build a log function that delegates to audit.log with a skill prefix.
---- Returns nil (not a function) if audit has not been initialised, so the
---- sandbox treats logging as optional.
 local function make_log_fn(skill_name)
   return function(event, data)
     audit.log("skill." .. skill_name .. "." .. event, data)
   end
 end
 
---- Read an entire file to a string, or return nil + error.
-local function read_file(path)
-  local f, err = io.open(path, "r")
-  if not f then return nil, err end
-  local content = f:read("*a")
-  f:close()
-  return content
-end
-
---- Determine the directory containing a given file path.
-local function dir_of(filepath)
-  return filepath:match("^(.+)/[^/]+$") or "."
-end
-
 -- ---------------------------------------------------------------------------
 -- skill_runner.execute
 -- ---------------------------------------------------------------------------
 
---- Load a skill by name and execute its run(args) function inside a sandbox.
----
---- Flow:
----   1. Load skill via skill_loader.load
----   2. Resolve dependencies
----   3. Build sandbox env from skill metadata + config
----   4. Execute the skill code in the sandbox
----   5. Call the module's run(args) function
----   6. Log all steps via audit
----
---- @param skill_name  string   bare name (no .lua extension)
---- @param args        any      argument passed to the skill's run() function
---- @param search_dirs table    ordered list of directories to search
---- @return any           result from run(), or nil + error string
 function M.execute(skill_name, args, search_dirs)
   if type(skill_name) ~= "string" or skill_name == "" then
     return nil, "skill_runner.execute: skill_name must be a non-empty string"
@@ -82,7 +49,7 @@ function M.execute(skill_name, args, search_dirs)
   local meta = skill.metadata
 
   -- 2. Resolve dependencies
-  local skill_dir = dir_of(skill.path)
+  local skill_dir = util.dir_of(skill.path)
   local dep_order, dep_err = skill_loader.resolve_dependencies(meta, skill_dir)
   if not dep_order then
     audit.log("skill.deps.error", { skill = skill_name, error = dep_err })
@@ -142,13 +109,7 @@ end
 -- Lua interpreter detection (cached at module load)
 -- ---------------------------------------------------------------------------
 
---- Probe for an available Lua interpreter binary.
---- Tries the running interpreter first (via arg global), then common names.
 local LUA_BIN = (function()
-  -- arg[-1] typically holds the interpreter path used to start the process.
-  -- However, busted (via luarocks) may stuff a full Lua bootstrap snippet
-  -- into arg[-1], which is not a usable binary path.  Only trust it if it
-  -- looks like a plain filesystem path (no spaces, parens, or semicolons).
   if type(arg) == "table" and type(arg[-1]) == "string" and arg[-1] ~= "" then
     local candidate = arg[-1]
     if not candidate:find("[%s%(%)%;]") then
@@ -156,21 +117,17 @@ local LUA_BIN = (function()
     end
   end
 
-  -- Fall back to probing common binary names.
   local candidates = { "lua", "lua5.4", "lua5.3", "lua5.2", "lua5.1", "luajit" }
   for _, name in ipairs(candidates) do
     local ok = os.execute(name .. " -e 'os.exit(0)' >/dev/null 2>&1")
-    -- os.execute returns true (Lua 5.2+) or 0 (Lua 5.1) on success.
     if ok == true or ok == 0 then
       return name
     end
   end
 
-  return nil  -- will cause run_tests to return an error
+  return nil
 end)()
 
---- Probe for a timeout command (GNU coreutils).
---- macOS ships without one; Homebrew provides `gtimeout`.
 local TIMEOUT_BIN = (function()
   for _, name in ipairs({ "timeout", "gtimeout" }) do
     local ok = os.execute(name .. " 0 true >/dev/null 2>&1")
@@ -178,22 +135,13 @@ local TIMEOUT_BIN = (function()
       return name
     end
   end
-  return nil  -- timeout enforcement will be skipped
+  return nil
 end)()
 
 -- ---------------------------------------------------------------------------
 -- skill_runner.run_tests
 -- ---------------------------------------------------------------------------
 
---- Execute a test file as a subprocess and capture the results.
----
---- If a GNU-compatible timeout(1) binary is available, it is used for
---- wall-clock enforcement.  Otherwise the subprocess runs unguarded.
----
---- @param test_file_path   string  path to the *_test.lua file
---- @param timeout_seconds  number  maximum wall-clock seconds (default 60)
---- @return table|nil   { exit_code, output, passed, timed_out }
---- @return string|nil  error message
 function M.run_tests(test_file_path, timeout_seconds)
   if type(test_file_path) ~= "string" or test_file_path == "" then
     return nil, "skill_runner.run_tests: test_file_path must be a non-empty string"
@@ -213,10 +161,8 @@ function M.run_tests(test_file_path, timeout_seconds)
     return nil, "skill_runner.run_tests: no Lua interpreter found on PATH"
   end
 
-  -- Shell-quote the file path (basic: wrap in single quotes, escape inner ')
   local safe_path = "'" .. test_file_path:gsub("'", "'\\''") .. "'"
 
-  -- Build command with optional timeout prefix.
   local cmd
   if TIMEOUT_BIN then
     cmd = string.format(
@@ -238,8 +184,6 @@ function M.run_tests(test_file_path, timeout_seconds)
   local output = handle:read("*a")
   local ok, exit_type, exit_code = handle:close()
 
-  -- io.popen:close returns (true/nil, "exit"/"signal", code) in Lua 5.2+.
-  -- In Lua 5.1 it returns just the exit status number.
   if type(ok) == "number" then
     exit_code = ok
     ok = (exit_code == 0)
@@ -247,7 +191,6 @@ function M.run_tests(test_file_path, timeout_seconds)
     exit_code = exit_code or (ok and 0 or 1)
   end
 
-  -- timeout(1) / gtimeout returns exit code 124 when the process is killed.
   local timed_out = (exit_code == 124)
 
   return {
@@ -264,15 +207,7 @@ end
 
 --- Validate a skill file: parse metadata, verify public_functions exist in the
 --- returned module table, verify declared paths are within the allowed paths.
----
---- The cfg parameter is a plain table with at least:
----   { allowed_paths = { ... }, blocked_paths = { ... } }
---- This avoids requiring config to be loaded globally in test contexts.
----
---- @param skill_path string  path to the .lua skill file
---- @param cfg        table   config table with allowed_paths and blocked_paths
---- @return true|false
---- @return table|nil   list of error strings (when false)
+--- Now delegates ALL path matching to safe_fs (single source of truth).
 function M.validate_skill(skill_path, cfg)
   local errors = {}
 
@@ -295,12 +230,12 @@ function M.validate_skill(skill_path, cfg)
   end
 
   -- 2. Load and execute the skill code in a permissive sandbox to get module
-  local code, read_err = read_file(skill_path)
+  local code, read_err = util.read_file(skill_path)
   if not code then
     return false, { "cannot read skill file: " .. tostring(read_err) }
   end
 
-  local skill_dir = dir_of(skill_path)
+  local skill_dir = util.dir_of(skill_path)
   local env = sandbox.make_env({
     paths         = meta.paths        or {},
     allowed_paths = cfg.allowed_paths or {},
@@ -326,31 +261,31 @@ function M.validate_skill(skill_path, cfg)
     err("skill did not return a module table")
   end
 
-  -- 4. Verify declared paths are within config allowed_paths
-  local allowed  = cfg.allowed_paths or {}
-  local blocked  = cfg.blocked_paths or {}
+  -- 4. Verify declared paths against policy using safe_fs (single authority)
+  local allowed = cfg.allowed_paths or {}
+  local blocked = cfg.blocked_paths or {}
 
   for _, path_pattern in ipairs(meta.paths or {}) do
-    -- Strip trailing glob for matching
-    local prefix = path_pattern:gsub("/%*$", "")
+    -- Normalise the declared path for checking, preserving any trailing wildcard
+    local has_glob = path_pattern:find("/%*$")
+    local abs_path = util.normalize(path_pattern:gsub("/%*$", ""))
+    local check_path = has_glob and (abs_path .. "/*") or abs_path
 
-    -- Check against blocked_paths (prefix match)
+    -- Check blocked
     local is_blocked = false
     for _, bp in ipairs(blocked) do
-      if prefix == bp or prefix:sub(1, #bp + 1) == bp .. "/" then
+      if safe_fs.glob_match(check_path, bp) then
         err("declared path '" .. path_pattern .. "' is blocked by: " .. bp)
         is_blocked = true
         break
       end
     end
 
-    -- Check against allowed_paths (must be within at least one)
+    -- Check allowed
     if not is_blocked then
       local is_allowed = false
       for _, ap in ipairs(allowed) do
-        local ap_prefix = ap:gsub("/%*$", "")
-        if prefix == ap_prefix
-           or prefix:sub(1, #ap_prefix + 1) == ap_prefix .. "/" then
+        if safe_fs.glob_match(check_path, ap) then
           is_allowed = true
           break
         end

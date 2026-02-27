@@ -4,16 +4,14 @@
 --- SECURITY INVARIANT: This module never moves, copies, or chmods skill files.
 --- It may only *print* commands a human should run. Promotion is always manual.
 ---
---- Rocks: cjson (cjson.safe), luafilesystem (lfs), uuid
+--- Rocks: cjson (cjson.safe), luafilesystem (lfs), uuid, penlight
 
 local cjson = require("cjson.safe")
 local lfs   = require("lfs")
 local uuid  = require("uuid")
+local util  = require("util")
 
 -- Initialise the RNG once at module load time.
--- uuid.set_rng() expects a function(n) that returns a binary string of n
--- random bytes.  We build one from math.random, seeded with a mix of
--- os.time() and os.clock() for sub-second resolution.
 do
   math.randomseed(math.floor(os.time() + os.clock() * 10000))
   uuid.set_rng(function(n)
@@ -26,17 +24,11 @@ do
 end
 
 -- ---------------------------------------------------------------------------
--- Lazy-load optional / not-yet-written modules so this file requires cleanly
--- regardless of whether they exist yet.
+-- Lazy-load optional / not-yet-written modules
 -- ---------------------------------------------------------------------------
 
-local function try_require(name)
-  local ok, mod = pcall(require, name)
-  return ok and mod or nil
-end
-
-local config = try_require("config")
-local audit  = try_require("audit")
+local config = util.try_require("config")
+local audit  = util.try_require("audit")
 
 local M = {}
 
@@ -44,71 +36,9 @@ local M = {}
 -- Internal helpers
 -- ---------------------------------------------------------------------------
 
---- Return current time as an ISO 8601 UTC string.
-local function iso8601()
-  return os.date("!%Y-%m-%dT%H:%M:%SZ")
-end
-
 --- Generate a UUID v4 string using the uuid luarock.
 local function new_uuid()
   return uuid()
-end
-
---- Ensure a directory and all parents exist (mirrors config.lua's mkdir_p).
---- Handles both absolute paths (starting with /) and relative paths.
-local function mkdir_p(path)
-  -- Determine if path is absolute so we can reconstruct it correctly.
-  local is_absolute = path:sub(1, 1) == "/"
-  local acc = is_absolute and "" or "."
-
-  for seg in path:gmatch("[^/]+") do
-    -- Skip "." segments that come from relative paths like "./foo"
-    if seg ~= "." then
-      acc = acc .. "/" .. seg
-      local attr = lfs.attributes(acc)
-      if not attr then
-        local ok, err = lfs.mkdir(acc)
-        if not ok and not lfs.attributes(acc) then
-          return nil, "mkdir " .. acc .. ": " .. (err or "")
-        end
-      elseif attr.mode ~= "directory" then
-        return nil, acc .. " exists but is not a directory"
-      end
-    end
-  end
-  return true
-end
-
---- Read entire file to string, return (content) or (nil, err).
-local function read_file(path)
-  local f, err = io.open(path, "r")
-  if not f then return nil, err end
-  local content = f:read("*a")
-  f:close()
-  return content
-end
-
---- Write string atomically: write to .tmp then rename.
-local function write_file_atomic(path, content)
-  local tmp = path .. ".tmp"
-  local f, err = io.open(tmp, "w")
-  if not f then
-    return nil, "cannot write " .. tmp .. ": " .. tostring(err)
-  end
-  f:write(content)
-  f:close()
-  local ok, ren_err = os.rename(tmp, path)
-  if not ok then
-    os.remove(tmp)
-    return nil, "rename failed: " .. tostring(ren_err)
-  end
-  return true
-end
-
---- Escape a path for safe embedding in a double-quoted shell argument.
---- Doubles any embedded double-quote characters.
-local function shell_quote(path)
-  return '"' .. path:gsub('"', '\\"') .. '"'
 end
 
 --- Count files in a directory matching a pattern (for stable naming).
@@ -121,7 +51,7 @@ local function count_files_in_dir(dir)
   return math.max(0, n - 2)  -- subtract . and ..
 end
 
---- Try to log via audit module; silently skip if audit is unavailable or uninitialised.
+--- Try to log via audit module; silently skip if audit is unavailable.
 local function try_audit(event, data)
   if audit and type(audit.log) == "function" then
     audit.log(event, data)
@@ -129,10 +59,8 @@ local function try_audit(event, data)
 end
 
 --- Locate the state/pending_approvals directory.
---- Uses state.dir() if the state module is initialised; otherwise falls back
---- to ./state/pending_approvals.  Callers may also pass approvals_dir explicitly.
 local function default_approvals_dir()
-  local state = try_require("state")
+  local state = util.try_require("state")
   if state and type(state.dir) == "function" then
     local d = state.dir()
     if d then return d .. "/pending_approvals" end
@@ -142,7 +70,7 @@ end
 
 --- Load and decode a JSON file. Returns (table) or (nil, err).
 local function load_json_file(path)
-  local raw, err = read_file(path)
+  local raw, err = util.read_file(path)
   if not raw then return nil, err end
   local parsed, parse_err = cjson.decode(raw)
   if not parsed then
@@ -157,11 +85,10 @@ local function save_record(path, record)
   if not encoded then
     return nil, "JSON encode failed: " .. tostring(err)
   end
-  return write_file_atomic(path, encoded)
+  return util.write_file_atomic(path, encoded)
 end
 
 --- Find the file path for an approval record by ID within approvals_dir.
---- Returns (filepath, record) or (nil, err).
 local function find_record(approvals_dir, approval_id)
   local attr = lfs.attributes(approvals_dir)
   if not attr or attr.mode ~= "directory" then
@@ -185,12 +112,6 @@ end
 -- Public API
 -- ---------------------------------------------------------------------------
 
---- Create a pending approval record and persist it to approvals_dir.
----
---- approvals_dir defaults to ./state/pending_approvals (or from state module).
---- Filename: skill_<n>_<uuid>.json
----
---- Returns (record_table) or (nil, error_string).
 function M.create(skill_name, skill_path, test_path, test_results, metadata, approvals_dir)
   if type(skill_name) ~= "string" or skill_name == "" then
     return nil, "approval.create: skill_name must be a non-empty string"
@@ -198,7 +119,7 @@ function M.create(skill_name, skill_path, test_path, test_results, metadata, app
 
   approvals_dir = approvals_dir or default_approvals_dir()
 
-  local ok, err = mkdir_p(approvals_dir)
+  local ok, err = util.mkdir_p(approvals_dir)
   if not ok then
     return nil, "approval.create: cannot create approvals dir: " .. tostring(err)
   end
@@ -211,12 +132,12 @@ function M.create(skill_name, skill_path, test_path, test_results, metadata, app
   local record = {
     id           = id,
     skill_name   = skill_name,
-    created_at   = iso8601(),
+    created_at   = util.iso8601(),
     skill_path   = skill_path   or "",
     test_path    = test_path    or "",
     test_results = test_results or {},
     metadata     = metadata     or {},
-    approved     = cjson.null,   -- nil/unresolved; JSON null
+    approved     = cjson.null,
     resolved_at  = cjson.null,
     promoted     = false,
     promoted_at  = cjson.null,
@@ -233,12 +154,9 @@ function M.create(skill_name, skill_path, test_path, test_results, metadata, app
     path       = path,
   })
 
-  -- Decode what we wrote so booleans / nulls are consistent
   return load_json_file(path)
 end
 
---- Return all approval records in approvals_dir, sorted by filename.
---- Returns (list_of_records) — empty list on missing/empty dir.
 function M.list_pending(approvals_dir)
   approvals_dir = approvals_dir or default_approvals_dir()
 
@@ -247,7 +165,6 @@ function M.list_pending(approvals_dir)
     return {}
   end
 
-  -- Collect filenames first for stable sort
   local filenames = {}
   for filename in lfs.dir(approvals_dir) do
     if filename:match("%.json$") then
@@ -268,8 +185,6 @@ function M.list_pending(approvals_dir)
   return records
 end
 
---- Load a single approval record by ID.
---- Returns (record_table) or (nil, error_string).
 function M.get(approvals_dir, approval_id)
   if type(approval_id) ~= "string" or approval_id == "" then
     return nil, "approval.get: approval_id must be a non-empty string"
@@ -283,12 +198,6 @@ function M.get(approvals_dir, approval_id)
   return record
 end
 
---- Resolve an approval: set approved=true/false and resolved_at.
----
---- SECURITY: This function MUST NOT promote, copy, or chmod any files.
---- If opts contains {promote=true} or similar, return an error immediately.
----
---- Returns (updated_record) or (nil, error_string).
 function M.resolve(approvals_dir, approval_id, approved, opts)
   -- Hard guard: reject any attempt to sneak promotion through resolve.
   if type(opts) == "table" then
@@ -314,10 +223,8 @@ function M.resolve(approvals_dir, approval_id, approved, opts)
     return nil, "approval.resolve: " .. tostring(record)
   end
 
-  -- Update only status fields — never touch promoted/promoted_at.
   record.approved    = approved
-  record.resolved_at = iso8601()
-  -- Explicitly ensure promoted stays false if unset.
+  record.resolved_at = util.iso8601()
   if record.promoted == nil then
     record.promoted = false
   end
@@ -336,9 +243,6 @@ function M.resolve(approvals_dir, approval_id, approved, opts)
   return load_json_file(filepath)
 end
 
---- Check whether skill_name.lua exists in allowed_dir.
---- Returns true if it exists, false otherwise.
---- Does NOT modify the record or trigger any action.
 function M.check_promotion(skill_name, allowed_dir, record)
   if type(skill_name) ~= "string" or skill_name == "" then return false end
   if type(allowed_dir) ~= "string" or allowed_dir == "" then return false end
@@ -348,12 +252,6 @@ function M.check_promotion(skill_name, allowed_dir, record)
   return attr ~= nil and attr.mode == "file"
 end
 
---- Mark a record as promoted IFF the skill file already exists in allowed_dir.
----
---- This ONLY updates the record on disk; it does not create or move any files.
---- If the file does not exist, returns (nil, "NotPromoted: file not found in allowed_dir").
----
---- Returns (updated_record) or (nil, error_string).
 function M.mark_promoted(approvals_dir, approval_id, allowed_dir)
   if type(approval_id) ~= "string" or approval_id == "" then
     return nil, "approval.mark_promoted: approval_id must be a non-empty string"
@@ -375,7 +273,7 @@ function M.mark_promoted(approvals_dir, approval_id, allowed_dir)
   end
 
   record.promoted    = true
-  record.promoted_at = iso8601()
+  record.promoted_at = util.iso8601()
 
   local ok, err = save_record(filepath, record)
   if not ok then
@@ -391,10 +289,6 @@ function M.mark_promoted(approvals_dir, approval_id, allowed_dir)
   return load_json_file(filepath)
 end
 
---- Display a formatted approval prompt and read a single keypress from stdin.
----
---- Returns one of: "view", "rerun", "edit", "approve", "reject",
----                 "print_promote", "mark_promoted"
 function M.prompt_human(record)
   if type(record) ~= "table" then
     return nil, "approval.prompt_human: record must be a table"
@@ -412,7 +306,6 @@ function M.prompt_human(record)
   io.write("│  test_path  : " .. tostring(record.test_path  or "—") .. "\n")
   io.write("│  created_at : " .. tostring(record.created_at or "—") .. "\n")
 
-  -- Test results
   local results = record.test_results or {}
   if type(results) == "table" and #results > 0 then
     io.write("├─────────────────────────────────────────────────────┤\n")
@@ -424,7 +317,6 @@ function M.prompt_human(record)
     end
   end
 
-  -- Metadata extras
   local meta = record.metadata or {}
   if type(meta.dependencies) == "table" and #meta.dependencies > 0 then
     io.write("├─────────────────────────────────────────────────────┤\n")
@@ -461,12 +353,6 @@ function M.prompt_human(record)
   return key_map[input] or "reject"
 end
 
---- Return a list of exact shell commands a human must run to promote a skill.
----
---- Commands include mkdir -p, cp, and chmod. Paths are double-quoted with
---- embedded quotes escaped. No commands are executed.
----
---- Returns a list of strings.
 function M.get_promotion_commands(record, allowed_dir)
   if type(record) ~= "table" then
     return nil, "approval.get_promotion_commands: record must be a table"
@@ -481,9 +367,9 @@ function M.get_promotion_commands(record, allowed_dir)
 
   local cmds = {
     "# Promote skill '" .. skill_name .. "' to " .. allowed_dir,
-    "mkdir -p " .. shell_quote(allowed_dir),
-    "cp "       .. shell_quote(src) .. " " .. shell_quote(dst),
-    "chmod 444 " .. shell_quote(dst),
+    "mkdir -p " .. util.shell_quote(allowed_dir),
+    "cp "       .. util.shell_quote(src) .. " " .. util.shell_quote(dst),
+    "chmod 444 " .. util.shell_quote(dst),
     "# Verify the promotion was recorded:",
     "lua main.lua doctor",
   }
@@ -491,9 +377,6 @@ function M.get_promotion_commands(record, allowed_dir)
   return cmds
 end
 
---- Delegate to config.approval_tier(tier_name).
---- Returns the tier value ("auto", "prompt", or "manual").
---- Returns nil + error if config is unavailable.
 function M.check_tier(tier_name)
   if not config or type(config.approval_tier) ~= "function" then
     return nil, "approval.check_tier: config module unavailable"
@@ -505,15 +388,7 @@ function M.check_tier(tier_name)
   return result
 end
 
---- TRAP: Intentionally always fails.
----
---- Promotion must be performed by a human using the shell commands returned by
---- approval.get_promotion_commands(). If this function is ever called by
---- automated code, it will fail loudly here rather than silently doing
---- something dangerous.
----
---- Always returns: (nil, "HumanRequired: ...")
-function M.promote(...)  -- luacheck: ignore (varargs intentional)
+function M.promote(...)
   return nil,
     "HumanRequired: promotion must be performed manually. " ..
     "Use approval.get_promotion_commands() to obtain the required shell commands."

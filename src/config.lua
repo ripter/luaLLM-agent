@@ -1,9 +1,10 @@
 --- agent/config.lua
 --- Configuration loader, validator, and accessor for luallm-agent.
---- Uses luarocks: cjson, luafilesystem (lfs)
+--- Uses luarocks: cjson, luafilesystem (lfs), penlight
 
 local cjson = require("cjson.safe")
 local lfs   = require("lfs")
+local util  = require("util")
 
 local M = {}
 
@@ -77,101 +78,6 @@ local DEFAULT_CONFIG = {
 
   editor = "$EDITOR",
 }
-
--- ---------------------------------------------------------------------------
--- Helpers
--- ---------------------------------------------------------------------------
-
---- Expand leading ~ to $HOME in a string.
-local function expand_tilde(s)
-  if type(s) ~= "string" then return s end
-  if s:sub(1, 1) == "~" then
-    return HOME .. s:sub(2)
-  end
-  return s
-end
-
---- Recursively expand ~ in all string values within a table.
-local function expand_paths(tbl)
-  if type(tbl) ~= "table" then return tbl end
-  local out = {}
-  for k, v in pairs(tbl) do
-    if type(v) == "string" then
-      out[k] = expand_tilde(v)
-    elseif type(v) == "table" then
-      out[k] = expand_paths(v)
-    else
-      out[k] = v
-    end
-  end
-  return out
-end
-
---- Deep-merge src into dst. src values win; tables are merged recursively.
---- Arrays (integer-keyed tables) are replaced wholesale, not merged element-wise.
-local function is_array(t)
-  if type(t) ~= "table" then return false end
-  local n = 0
-  for _ in pairs(t) do n = n + 1 end
-  return n == #t
-end
-
-local function deep_merge(dst, src)
-  local out = {}
-  for k, v in pairs(dst) do out[k] = v end
-  for k, v in pairs(src) do
-    if type(v) == "table" and type(out[k]) == "table"
-       and not is_array(v) and not is_array(out[k]) then
-      out[k] = deep_merge(out[k], v)
-    else
-      out[k] = v
-    end
-  end
-  return out
-end
-
---- Read an entire file to a string, or return nil + error.
-local function read_file(path)
-  local f, err = io.open(path, "r")
-  if not f then return nil, err end
-  local content = f:read("*a")
-  f:close()
-  return content
-end
-
---- Write a string to a file atomically (write tmp, rename).
-local function write_file_atomic(path, content)
-  local tmp = path .. ".tmp"
-  local f, err = io.open(tmp, "w")
-  if not f then return nil, "cannot write " .. tmp .. ": " .. (err or "") end
-  f:write(content)
-  f:close()
-  local ok, rerr = os.rename(tmp, path)
-  if not ok then
-    os.remove(tmp)
-    return nil, "rename failed: " .. (rerr or "")
-  end
-  return true
-end
-
---- Ensure a directory (and parents) exist.
-local function mkdir_p(path)
-  -- Walk each component
-  local acc = ""
-  for seg in path:gmatch("[^/]+") do
-    acc = acc .. "/" .. seg
-    local attr = lfs.attributes(acc)
-    if not attr then
-      local ok, err = lfs.mkdir(acc)
-      if not ok and not lfs.attributes(acc) then
-        return nil, "mkdir " .. acc .. ": " .. (err or "")
-      end
-    elseif attr.mode ~= "directory" then
-      return nil, acc .. " exists but is not a directory"
-    end
-  end
-  return true
-end
 
 -- ---------------------------------------------------------------------------
 -- Validation
@@ -289,7 +195,6 @@ function M.validate(cfg)
     if type(cfg.model_selection) ~= "table" then
       err("model_selection must be a table")
     else
-      -- must have a "default" entry
       if not cfg.model_selection.default then
         err("model_selection must contain a 'default' entry")
       end
@@ -324,7 +229,6 @@ end
 -- ---------------------------------------------------------------------------
 
 local function enforce_invariants(cfg)
-  -- skill_promotion is ALWAYS manual, no matter what the file says
   if cfg.approvals then
     cfg.approvals.skill_promotion = "manual"
   end
@@ -335,54 +239,45 @@ end
 -- Public API
 -- ---------------------------------------------------------------------------
 
---- Return the default config directory path.
 function M.default_dir()
   return DEFAULT_DIR
 end
 
---- Return the default config file path.
 function M.default_path()
   return DEFAULT_PATH
 end
 
 --- Generate the default config.json and directory skeleton.
---- Returns the path written, or nil + error.
 function M.init(dir)
   dir = dir or DEFAULT_DIR
-  local ok, err = mkdir_p(dir)
+  local ok, err = util.mkdir_p(dir)
   if not ok then return nil, err end
 
-  -- Create subdirectories
   for _, sub in ipairs({ "state", "state/pending_approvals", "skills", "skills/agent", "skills/allowed", "skills/allowed/.archive" }) do
     local subdir = dir .. "/" .. sub
-    ok, err = mkdir_p(subdir)
+    ok, err = util.mkdir_p(subdir)
     if not ok then return nil, err end
   end
 
   local path = dir .. "/config.json"
 
-  -- Don't overwrite an existing config
   if lfs.attributes(path) then
     return path, "already exists"
   end
 
-  local content = cjson.encode(DEFAULT_CONFIG)
+  local content = M.pretty_json(DEFAULT_CONFIG)
 
-  -- cjson output is compact; pretty-print for human readability
-  content = M.pretty_json(DEFAULT_CONFIG)
-
-  ok, err = write_file_atomic(path, content .. "\n")
+  ok, err = util.write_file_atomic(path, content .. "\n")
   if not ok then return nil, err end
 
   return path
 end
 
 --- Load config from disk, merge with defaults, validate, enforce invariants.
---- Returns true or nil + error string.
 function M.load(path)
   path = path or DEFAULT_PATH
 
-  local raw, read_err = read_file(path)
+  local raw, read_err = util.read_file(path)
   if not raw then
     return nil, "cannot read config: " .. (read_err or path)
   end
@@ -392,20 +287,15 @@ function M.load(path)
     return nil, "invalid JSON in " .. path .. ": " .. (parse_err or "unknown error")
   end
 
-  -- Merge user config over defaults (defaults fill in anything missing)
-  local merged = deep_merge(DEFAULT_CONFIG, parsed)
+  local merged = util.deep_merge(DEFAULT_CONFIG, parsed)
 
-  -- Validate
   local ok, errs = M.validate(merged)
   if not ok then
     return nil, "config validation failed:\n  " .. table.concat(errs, "\n  ")
   end
 
-  -- Enforce non-negotiable invariants
   merged = enforce_invariants(merged)
-
-  -- Expand ~ in all string values
-  merged = expand_paths(merged)
+  merged = util.expand_paths(merged)
 
   loaded   = merged
   cfg_path = path
@@ -413,7 +303,6 @@ function M.load(path)
 end
 
 --- Get a value by dotted path, e.g. config.get("luallm.binary").
---- Returns the value or nil if not found.
 function M.get(dotted_path)
   if not loaded then
     error("config not loaded: call config.load() first")
@@ -427,7 +316,6 @@ function M.get(dotted_path)
   return current
 end
 
---- Return the entire loaded config table (read-only intent; Lua won't enforce).
 function M.all()
   if not loaded then
     error("config not loaded: call config.load() first")
@@ -435,45 +323,43 @@ function M.all()
   return loaded
 end
 
---- Return the file path that was loaded.
 function M.path()
   return cfg_path
 end
 
---- Check whether a path is in the loaded config's blocked_paths.
---- Uses prefix matching: blocked entry "/etc" blocks "/etc/passwd".
---- Supports trailing glob: "~/data/*" matches anything under ~/data/.
+--- Check whether a path is blocked or allowed.
+--- Delegates to safe_fs for the actual matching (single source of truth).
+--- safe_fs is lazy-loaded to avoid circular dependency at require time.
 function M.is_path_blocked(path)
   if not loaded then
     error("config not loaded: call config.load() first")
   end
-  path = expand_tilde(path)
+  local safe_fs = require("safe_fs")
+  path = util.expand_tilde(path)
+  local abs = util.normalize(path)
   for _, blocked in ipairs(loaded.blocked_paths or {}) do
-    if path == blocked or path:sub(1, #blocked + 1) == blocked .. "/" then
+    if safe_fs.glob_match(abs, blocked) then
       return true, blocked
     end
   end
   return false
 end
 
---- Check whether a path matches any entry in allowed_paths.
---- Supports prefix matching and trailing glob (*).
 function M.is_path_allowed(path)
   if not loaded then
     error("config not loaded: call config.load() first")
   end
 
-  -- Always blocked takes precedence
   local blocked, by = M.is_path_blocked(path)
   if blocked then
     return false, "blocked by: " .. by
   end
 
-  path = expand_tilde(path)
+  local safe_fs = require("safe_fs")
+  path = util.expand_tilde(path)
+  local abs = util.normalize(path)
   for _, allowed in ipairs(loaded.allowed_paths or {}) do
-    -- Strip trailing /* for prefix matching
-    local prefix = allowed:gsub("/%*$", "")
-    if path == prefix or path:sub(1, #prefix + 1) == prefix .. "/" then
+    if safe_fs.glob_match(abs, allowed) then
       return true
     end
   end
@@ -481,28 +367,22 @@ function M.is_path_allowed(path)
   return false, "not in allowed_paths"
 end
 
---- Check the approval tier setting for a given tier name.
---- Returns "auto", "prompt", or "manual".
 function M.approval_tier(tier_name)
   if not loaded then
     error("config not loaded: call config.load() first")
   end
 
-  -- Hardcoded override: skill_promotion is always manual
   if tier_name == "skill_promotion" then
     return "manual"
   end
 
   local val = loaded.approvals and loaded.approvals[tier_name]
   if not val then
-    return "prompt"  -- safe default
+    return "prompt"
   end
   return val
 end
 
---- Return the model selection policy for a given task type.
---- Falls back to "default" if the task type has no specific entry.
---- Returns { prefer = {...}, fallback = {...} }
 function M.model_policy(task_type)
   if not loaded then
     error("config not loaded: call config.load() first")
@@ -521,14 +401,12 @@ function M.model_policy(task_type)
   }
 end
 
---- Check if the config file on disk is writable by the current process.
---- Returns false if read-only (which is the safe state).
 function M.is_writable()
   if not cfg_path then return false end
   local f = io.open(cfg_path, "a")
   if f then
     f:close()
-    return true   -- writable = potentially unsafe
+    return true
   end
   return false
 end
@@ -537,8 +415,6 @@ end
 -- Pretty JSON (minimal, for init output)
 -- ---------------------------------------------------------------------------
 
---- Simple pretty-print for JSON-compatible Lua tables.
---- Produces human-readable output for the default config file.
 function M.pretty_json(val, indent)
   indent = indent or 0
   local pad  = string.rep("  ", indent)
@@ -553,8 +429,7 @@ function M.pretty_json(val, indent)
   elseif type(val) == "string" then
     return cjson.encode(val)
   elseif type(val) == "table" then
-    -- Detect array vs object
-    if is_array(val) then
+    if util.is_array(val) then
       if #val == 0 then return "[]" end
       local items = {}
       for _, v in ipairs(val) do
@@ -562,7 +437,6 @@ function M.pretty_json(val, indent)
       end
       return "[\n" .. table.concat(items, ",\n") .. "\n" .. pad .. "]"
     else
-      -- Collect keys and sort for stable output
       local keys = {}
       for k in pairs(val) do keys[#keys + 1] = k end
       table.sort(keys)

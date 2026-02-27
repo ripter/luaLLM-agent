@@ -48,6 +48,9 @@ local function make_deps(overrides)
       if complete_err then return nil, complete_err end
       return complete_resp, nil
     end,
+    resolve_model = overrides.resolve_model or function()
+      return overrides.model or "test-model", overrides.port
+    end,
   }
 
   local validate_ok  = overrides.validate_ok

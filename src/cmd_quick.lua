@@ -4,51 +4,9 @@
 local M = {}
 
 -- ---------------------------------------------------------------------------
--- Model resolution
--- ---------------------------------------------------------------------------
-
---- Pick the best model+port from a status response.
---- Priority: config luallm.model > first running server > state.last_used.
---- Returns (model_name, port_or_nil).
-local function resolve_model(state, config)
-  -- 1. Config explicit model.
-  local cfg_ok, cfg_model = pcall(config.get, "luallm.model")
-  if cfg_ok and type(cfg_model) == "string" and cfg_model ~= "" then
-    return cfg_model, nil
-  end
-
-  -- 2. First running server.
-  for _, entry in ipairs(state.servers or {}) do
-    if entry.state == "running" and (entry.model or entry.name) and entry.port then
-      return entry.model or entry.name, math.floor(entry.port)
-    end
-  end
-
-  -- 3. last_used fallback — look up its port in the servers list.
-  if type(state.last_used) == "string" and state.last_used ~= "" then
-    for _, entry in ipairs(state.servers or {}) do
-      if (entry.model or entry.name) == state.last_used and entry.port then
-        return state.last_used, math.floor(entry.port)
-      end
-    end
-    -- last_used known but no port — return name and let complete() find port.
-    return state.last_used, nil
-  end
-
-  return nil, nil
-end
-
--- ---------------------------------------------------------------------------
 -- Public API
 -- ---------------------------------------------------------------------------
 
---- Run the quick-prompt command.
----
---- deps = { luallm, config }
---- args = { prompt }
----
---- Returns (content_string, info_table) on success or (nil, error_string) on failure.
---- info_table = { model }
 function M.run(deps, args)
   local luallm = deps.luallm
   local config = deps.config
@@ -60,7 +18,8 @@ function M.run(deps, args)
     return nil, "could not reach luallm: " .. tostring(state_err)
   end
 
-  local model, port = resolve_model(state, config)
+  -- Use the shared resolve_model from luallm module
+  local model, port = luallm.resolve_model(state)
   if not model then
     return nil, "no running model found in luallm status"
   end

@@ -1,23 +1,15 @@
 --- src/skill_loader.lua
 --- Load skill files, parse metadata headers, resolve dependencies.
---- Rocks: luafilesystem (lfs)
+--- Rocks: luafilesystem (lfs), penlight
 
-local lfs = require("lfs")
+local lfs  = require("lfs")
+local util = require("util")
 
 local M = {}
 
 -- ---------------------------------------------------------------------------
 -- Helpers
 -- ---------------------------------------------------------------------------
-
---- Read an entire file to a string, or return nil + error.
-local function read_file(path)
-  local f, err = io.open(path, "r")
-  if not f then return nil, err end
-  local content = f:read("*a")
-  f:close()
-  return content
-end
 
 --- Read a file line by line into a table.
 local function read_lines(path)
@@ -41,46 +33,29 @@ local function is_test_file(name)
   return type(name) == "string" and name:match("_test%.lua$") ~= nil
 end
 
---- Strip the .lua extension from a filename.
-local function strip_lua_ext(name)
-  return name:sub(1, -5)
-end
-
 -- ---------------------------------------------------------------------------
 -- Metadata parsing
 -- ---------------------------------------------------------------------------
 
---- Extract the @skill metadata block from lines starting with `---`.
---- The block starts at a line containing `---@skill` and continues through
---- all contiguous `---` prefixed lines.  The `---` prefixes are stripped and
---- the inner text concatenated, then evaluated as `return { ... }`.
----
---- @param lines table  array of source lines
---- @return string|nil  raw text of the metadata block (without --- prefixes)
---- @return string|nil  error message
 local function extract_metadata_text(lines)
   local in_block = false
   local parts    = {}
 
   for _, line in ipairs(lines) do
     if not in_block then
-      -- Look for the opening marker: a line whose stripped content starts with @skill
       local stripped = line:match("^%-%-%-%s*(.*)$")
       if stripped and stripped:match("^@skill") then
         in_block = true
-        -- Keep everything after "@skill" (usually " {" or "{")
         local after = stripped:match("^@skill%s*(.*)$")
         if after and after ~= "" then
           parts[#parts + 1] = after
         end
       end
     else
-      -- Inside the block: keep collecting --- lines
       local stripped = line:match("^%-%-%-%s?(.*)$")
       if stripped then
         parts[#parts + 1] = stripped
       else
-        -- First non-comment line ends the block
         break
       end
     end
@@ -93,14 +68,7 @@ local function extract_metadata_text(lines)
   return table.concat(parts, "\n")
 end
 
---- Parse a metadata text block into a Lua table using a restricted load.
---- The text is expected to be a Lua table literal (e.g. "{ name = ... }").
----
---- @param text string  raw metadata text
---- @return table|nil   parsed metadata
---- @return string|nil  error message
 local function parse_metadata_text(text)
-  -- Build a minimal safe environment for the loader.
   local safe_env = {
     math     = math,
     string   = string,
@@ -117,11 +85,9 @@ local function parse_metadata_text(text)
   local chunk, load_err
   local source = "return " .. text
   if setfenv then
-    -- Lua 5.1
     chunk, load_err = loadstring(source, "=skill_metadata")
     if chunk then setfenv(chunk, safe_env) end
   else
-    -- Lua 5.2+
     chunk, load_err = load(source, "=skill_metadata", "t", safe_env)
   end
 
@@ -141,12 +107,6 @@ local function parse_metadata_text(text)
   return result
 end
 
---- Validate required fields in a parsed metadata table.
---- Required: name (string), version (string), public_functions (non-empty array).
----
---- @param meta table
---- @return true|nil
---- @return string|nil  error message
 local function validate_metadata(meta)
   if type(meta.name) ~= "string" or meta.name == "" then
     return nil, "metadata: 'name' must be a non-empty string"
@@ -166,7 +126,6 @@ local function validate_metadata(meta)
     end
   end
 
-  -- Fill in optional fields with sensible defaults.
   meta.description  = meta.description  or ""
   meta.dependencies = meta.dependencies or {}
   meta.paths        = meta.paths        or {}
@@ -179,12 +138,6 @@ end
 -- Public API
 -- ---------------------------------------------------------------------------
 
---- Parse the @skill metadata header from a file on disk.
---- Returns the metadata table (with defaults filled in) or nil + error.
----
---- @param file_path string  absolute or relative path to a .lua skill file
---- @return table|nil   metadata
---- @return string|nil  error message
 function M.parse_metadata(file_path)
   if type(file_path) ~= "string" or file_path == "" then
     return nil, "skill_loader.parse_metadata: file_path must be a non-empty string"
@@ -213,16 +166,6 @@ function M.parse_metadata(file_path)
   return meta
 end
 
---- Load a skill by name from the first matching directory in search_dirs.
---- Looks for <skill_name>.lua in each directory in order.
----
---- Returns { metadata = <table>, code = <string>, path = <string> }
---- or nil + error.
----
---- @param skill_name  string   bare name (no .lua extension)
---- @param search_dirs table    ordered list of directory paths to search
---- @return table|nil   skill record
---- @return string|nil  error message
 function M.load(skill_name, search_dirs)
   if type(skill_name) ~= "string" or skill_name == "" then
     return nil, "skill_loader.load: skill_name must be a non-empty string"
@@ -240,14 +183,12 @@ function M.load(skill_name, search_dirs)
     local attr = lfs.attributes(path)
 
     if attr and attr.mode == "file" then
-      -- Found the file — parse metadata.
       local meta, meta_err = M.parse_metadata(path)
       if not meta then
         return nil, meta_err
       end
 
-      -- Read full source code.
-      local code, read_err = read_file(path)
+      local code, read_err = util.read_file(path)
       if not code then
         return nil, "skill_loader.load: cannot read '" .. path .. "': " .. tostring(read_err)
       end
@@ -266,18 +207,6 @@ function M.load(skill_name, search_dirs)
     .. "' not found in: " .. table.concat(tried, ", ")
 end
 
---- Resolve the dependency tree for a skill's metadata.
---- Verifies that every entry in metadata.dependencies exists as a .lua file
---- in allowed_dir, and performs a depth-first traversal to detect circular
---- dependencies.
----
---- Returns an ordered load list (dependencies first, no duplicates)
---- or nil + error.
----
---- @param metadata    table   skill metadata (must have .dependencies)
---- @param allowed_dir string  directory containing dependency .lua files
---- @return table|nil   ordered list of module names to load
---- @return string|nil  error message
 function M.resolve_dependencies(metadata, allowed_dir)
   if type(metadata) ~= "table" then
     return nil, "skill_loader.resolve_dependencies: metadata must be a table"
@@ -292,16 +221,14 @@ function M.resolve_dependencies(metadata, allowed_dir)
     return {}
   end
 
-  -- State for DFS cycle detection.
   local UNVISITED = 0
   local VISITING  = 1
   local VISITED   = 2
 
-  local state      = {}  -- modname → UNVISITED / VISITING / VISITED
-  local order      = {}  -- topologically sorted result
-  local order_set  = {}  -- quick dedup lookup
+  local state      = {}
+  local order      = {}
+  local order_set  = {}
 
-  --- Recursive DFS visit.
   local function visit(modname, chain)
     if state[modname] == VISITED then
       return true
@@ -312,7 +239,6 @@ function M.resolve_dependencies(metadata, allowed_dir)
         .. table.concat(chain, " -> ") .. " -> " .. modname
     end
 
-    -- Verify the file exists.
     local filepath = allowed_dir .. "/" .. modname .. ".lua"
     local attr = lfs.attributes(filepath)
     if not attr or attr.mode ~= "file" then
@@ -322,7 +248,6 @@ function M.resolve_dependencies(metadata, allowed_dir)
     state[modname] = VISITING
     chain[#chain + 1] = modname
 
-    -- Parse the dependency's own metadata to discover transitive deps.
     local meta, meta_err = M.parse_metadata(filepath)
     if meta and meta.dependencies then
       for _, sub_dep in ipairs(meta.dependencies) do
@@ -342,7 +267,6 @@ function M.resolve_dependencies(metadata, allowed_dir)
     return true
   end
 
-  -- Kick off DFS from each direct dependency.
   for _, dep in ipairs(deps) do
     state[dep] = state[dep] or UNVISITED
     local ok, err = visit(dep, {})
@@ -354,11 +278,6 @@ function M.resolve_dependencies(metadata, allowed_dir)
   return order
 end
 
---- Scan a directory for skill .lua files (excluding *_test.lua) and return
---- a summary list with basic metadata parsed from each.
----
---- @param dir string  path to the directory to scan
---- @return table      list of { name, version, description, path } records
 function M.list(dir)
   if type(dir) ~= "string" or dir == "" then
     return {}
@@ -391,7 +310,6 @@ function M.list(dir)
     end
   end
 
-  -- Sort by name for deterministic output.
   table.sort(results, function(a, b) return a.name < b.name end)
 
   return results
