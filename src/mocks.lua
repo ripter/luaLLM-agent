@@ -262,19 +262,6 @@ function M.make_plan_deps(overrides)
   local gen_ctx = overrides.gen_ctx
               or M.make_gen_ctx(overrides.gen_ctx_overrides, written_set)
 
-  -- Plain cmd_generate stub (used for no-context fallback path).
-  -- Also writes to written_set so fs.exists sees the output after generate.
-  local cmd_generate = overrides.cmd_generate or {
-    run = function(_, gen_args)
-      if gen_args.output_path then written_set[gen_args.output_path] = true end
-      return true, { model = "test-model", tokens = "1", output_path = gen_args.output_path }
-    end,
-    run_with_context = function(_, gen_args)
-      if gen_args.output_path then written_set[gen_args.output_path] = true end
-      return true, { model = "test-model", tokens = "1", output_path = gen_args.output_path }
-    end,
-  }
-
   local fs = overrides.fs
           or M.make_fs(overrides.existing_outputs, written_set)
 
@@ -292,7 +279,6 @@ function M.make_plan_deps(overrides)
     plan                 = plan_mod,
     globber              = overrides.globber or function(pat) return { pat } end,
     cmd_generate_context = gen_ctx,
-    cmd_generate         = cmd_generate,
     luallm               = luallm,
     safe_fs              = safe_fs,
     config               = config,

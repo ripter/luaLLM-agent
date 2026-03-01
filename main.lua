@@ -254,6 +254,30 @@ local function run_generate_with_context(args)
 end
 
 -- ---------------------------------------------------------------------------
+-- Command: plan
+-- ---------------------------------------------------------------------------
+
+local function run_plan(args)
+  local cmd_plan = require("cmd_plan")
+
+  local ok, err = cmd_plan.run({
+    subcommand = args.subcommand,
+    plan_path  = args.plan_path,
+  })
+
+  if not ok then
+    print("")
+    for line in (tostring(err) .. "\n"):gmatch("([^\n]*)\n") do
+      if line ~= "" then
+        print(co("%{red}", "  ✗ ") .. line)
+      end
+    end
+    print("")
+    os.exit(1)
+  end
+end
+
+-- ---------------------------------------------------------------------------
 -- Command registry
 -- ---------------------------------------------------------------------------
 
@@ -354,6 +378,65 @@ local COMMANDS = {
     set generate.timeout_seconds in config.json to override the global limit:
       "generate": { "timeout_seconds": 600 }
     The global fallback is limits.llm_timeout_seconds (default 300s).
+    ]],
+  },
+  {
+    name  = "plan",
+    usage = "<new|run|check|resume> <plan_path>",
+    desc  = "Create, run, check, or resume a Markdown plan file.",
+    fn    = run_plan,
+    setup = function(parser)
+      parser:argument("subcommand", "Subcommand: new, run, check, or resume.")
+      parser:argument("plan_path",  "Path to the .md plan file.")
+    end,
+    detail = [[
+  Subcommands:
+    new     Create a blank plan file with all default keys filled in.
+    run     Execute the plan: call generate-with-context for each declared output.
+    check   Validate the plan file and resolve context globs; no LLM calls.
+    resume  Generate only the outputs that are missing (for interrupted runs).
+
+  Quickstart:
+    ./agent plan new    plans/my_feature.md
+    ./agent plan check  plans/my_feature.md
+    ./agent plan run    plans/my_feature.md
+    ./agent plan resume plans/my_feature.md
+
+  Plan file format:
+
+    Plans are Markdown files with ## sections:
+
+      # Title (optional)
+
+      ## plan
+      model: Qwen3-Coder-Next-Q8_0
+      sanitize_fences: true
+      context: src/config.lua
+      context: src/**/*.test.lua
+      output: src/my_module.lua
+      output: src/my_module.test.lua
+      test_runner: busted
+      test_goal: handles edge case X
+
+      ## system prompt
+      You are a Lua code generator. Output ONLY valid Lua code.
+
+      ## prompt
+      Implement a module that does X, following the patterns in the context files.
+
+  Plan section keys:
+    model            Override the running model (optional).
+    sanitize_fences  Strip markdown fences from output (default true).
+    context          File or glob pattern to include as context (repeatable).
+    output           File to generate (repeatable). Used by check and resume.
+    test_runner      Testing tool to use (note: plan runner does NOT execute tests).
+    test_goal        Human-readable test objective (informational, repeatable).
+
+  Notes:
+    - Only ## headers (not ###) begin a new section.
+    - Section names are case-insensitive.
+    - resume regenerates any declared outputs that don't exist on disk.
+    - Tests are NOT executed automatically by the plan runner.
     ]],
   },
 }
