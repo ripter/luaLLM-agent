@@ -1,10 +1,7 @@
 --- src/cmd_plan.test.lua
 --- Busted tests for src/cmd_plan.lua — dependency-injected via src/test/mocks.lua.
 
-local _src = debug.getinfo(1, "S").source:match("^@(.*/)") or "./"
-package.path = _src .. "?.lua;" .. _src .. "test/?.lua;" .. package.path
-
-local mocks   = require("mocks")
+local mocks    = require("test.mocks")
 local cmd_plan = require("cmd_plan")
 
 -- Shorthand
@@ -200,10 +197,8 @@ describe("cmd_plan.run (run)", function()
   end)
 
   it("returns nil + error when a declared output is missing after run", function()
-    -- gen_ctx_overrides with a custom run that does NOT write to written_set
     local gen_ctx_no_write = {
       run = function(_, gen_args)
-        -- Succeed but don't mark the file as written
         return true, { model = "m", tokens = "1", output_path = gen_args.output_path }
       end,
       _calls = {},
@@ -223,29 +218,26 @@ describe("cmd_plan.run (run)", function()
 
   it("falls back to plain generate when context patterns resolve to zero files", function()
     local cmd_generate_calls = {}
-
+    local cmd_generate_stub = {
+      run = function(_, gen_args)
+        cmd_generate_calls[#cmd_generate_calls + 1] = gen_args
+        return true, { model = "m", tokens = "1", output_path = gen_args.output_path }
+      end,
+    }
+    local gen_ctx_spy = {
+      run    = function() error("cmd_generate_context must not be called with no context") end,
+      _calls = {},
+    }
     local deps, _, _ = mocks.make_plan_deps({
-      plan_overrides = { context = {}, outputs = { "src/out.lua" } },
-      globber        = function(_) return {} end,
-      -- Inject a cmd_generate stub that tracks calls and writes to written_set
-      -- (make_plan_deps wires written_set into fs.exists automatically)
-      cmd_generate = {
-        run = function(_, gen_args)
-          cmd_generate_calls[#cmd_generate_calls + 1] = gen_args
-          -- Return success so cmd_plan proceeds to the fs.exists check.
-          -- written_set is handled by make_plan_deps's default fs stub via
-          -- the shared table — but since we're overriding cmd_generate we need
-          -- to also signal existence. Simplest: provide our own fs below.
-          return true, { model = "m", tokens = "1", output_path = gen_args.output_path }
-        end,
+      plan_overrides = {
+        context = {},
+        outputs = { "src/out.lua" },
+        prompt  = "Write a module.",
       },
-      -- fs always reports outputs as existing so the post-run check passes
-      fs = { exists = function(_) return true end },
-      -- gen_ctx_spy: if called, the test should fail
-      gen_ctx = {
-        run    = function() error("cmd_generate_context must not be called with no context") end,
-        _calls = {},
-      },
+      globber      = function(_) return {} end,
+      gen_ctx      = gen_ctx_spy,
+      cmd_generate = cmd_generate_stub,
+      fs           = { exists = function(_) return true end },
     })
 
     local ok, err = cmd_plan.run({ subcommand = "run", plan_path = "plan.md" }, deps)
@@ -324,7 +316,6 @@ describe("cmd_plan.run (resume)", function()
   end)
 
   it("returns nil + error when output still missing after generate", function()
-    -- A gen_ctx that "succeeds" but never marks files as written
     local gen_ctx_no_write = {
       run = function(_, gen_args)
         return true, { model = "m", tokens = "1", output_path = gen_args.output_path }
@@ -416,7 +407,6 @@ describe("cmd_plan.run (new)", function()
     local content = f:read("*a")
     f:close()
 
-    -- No literal placeholder title — users add their own # heading if they want one
     assert.is_falsy(content:find("# <title>", 1, true))
   end)
 

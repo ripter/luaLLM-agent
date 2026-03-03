@@ -1,3 +1,4 @@
+local inspect = require("inspect")
 --- src/cmd_plan.lua
 --- CLI entry for `plan run`, `plan check`, and `plan resume` sub-commands.
 ---
@@ -111,17 +112,20 @@ end
 local function run_generate_for_output(output_path, plan_table, context_files, deps)
   local wrapped_config = wrap_config(deps.config, plan_table)
 
+  -- local cmd_generate = deps.cmd_generate or require("cmd_generate")
+  local cmd_generate = deps.cmd_generate
+
   local gen_deps = {
     luallm       = deps.luallm,
     safe_fs      = deps.safe_fs,
     config       = wrapped_config,
-    cmd_generate = deps.cmd_generate,
+    cmd_generate = cmd_generate,
   }
 
   if #context_files == 0 then
     -- No context files: use plain generate rather than generate-with-context,
     -- which requires at least one file.
-    return deps.cmd_generate.run(gen_deps, {
+    return cmd_generate.run(gen_deps, {
       output_path = output_path,
       prompt      = plan_table.prompt,
     })
@@ -328,12 +332,13 @@ end
 --- Entry point called from main.lua.
 --- args = { subcommand = "run"|"check"|"resume", plan_path = "..." }
 function M.run(args, deps)
-  -- Merge defaults with any provided deps.
-  local d = default_deps()
+  -- When a deps table is explicitly provided (e.g. tests), use it as-is.
+  -- Only build default deps for production calls with no deps argument.
+  local d
   if type(deps) == "table" then
-    for k, v in pairs(deps) do
-      d[k] = v
-    end
+    d = deps
+  else
+    d = default_deps()
   end
 
   local subcommand = args and args.subcommand
