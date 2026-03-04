@@ -6,6 +6,7 @@
 --- Build order: handlers are added one step at a time (3a, 3b, …).
 --- Step 3a: handle_pending, handle_planning.
 --- Step 3b: handle_executing.
+--- Step 3c: handle_testing.
 
 local _src = debug.getinfo(1, "S").source:match("^@(.*/)") or "./"
 package.path = _src .. "?.lua;" .. package.path
@@ -166,6 +167,87 @@ local function handle_executing(deps, t)
 end
 
 -- ---------------------------------------------------------------------------
+-- Handler: TESTING → APPROVAL | REPLANNING | FAILED
+-- ---------------------------------------------------------------------------
+
+--- Derive the test file path from a skill file path.
+--- Convention: "path/to/foo.lua"  →  "path/to/foo.test.lua"
+local function test_path_for(skill_path)
+  return (skill_path:gsub("%.lua$", ".test.lua"))
+end
+
+local function handle_testing(deps, t)
+  local results  = {}
+  local failed   = {}
+
+  for _, skill_path in ipairs(t.skill_files or {}) do
+    local test_path = test_path_for(skill_path)
+
+    local result, run_err = deps.skill_runner.run_tests(test_path)
+
+    if not result then
+      -- Hard failure from run_tests (file not found, no Lua interpreter, etc.).
+      -- Treat as a test failure so the retry/fail logic applies uniformly.
+      results[#results + 1] = {
+        skill_path = skill_path,
+        test_path  = test_path,
+        passed     = false,
+        output     = tostring(run_err),
+        error      = run_err,
+      }
+      failed[#failed + 1] = {
+        skill_path = skill_path,
+        output     = tostring(run_err),
+      }
+    else
+      results[#results + 1] = {
+        skill_path = skill_path,
+        test_path  = test_path,
+        passed     = result.passed,
+        output     = result.output,
+        exit_code  = result.exit_code,
+        timed_out  = result.timed_out,
+      }
+      if not result.passed then
+        failed[#failed + 1] = {
+          skill_path = skill_path,
+          output     = result.output,
+        }
+      end
+    end
+  end
+
+  t.test_results = results
+
+  if #failed == 0 then
+    deps.task.transition(t, deps.task.APPROVAL, "all tests passed")
+    return t
+  end
+
+  -- Build a summary of failures for the error context (used by handle_replanning).
+  local parts = {}
+  for _, f in ipairs(failed) do
+    parts[#parts + 1] = f.skill_path .. ":\n" .. f.output
+  end
+  local err_summary = "test failures (" .. #failed .. "/" .. #results .. "):\n"
+                    .. table.concat(parts, "\n---\n")
+
+  t.error = err_summary
+
+  deps.task.bump_attempt(t, "test")
+
+  if deps.task.can_retry(t, "test") then
+    deps.task.transition(t, deps.task.REPLANNING,
+      "testing failed (will retry): " .. #failed .. " skill(s) failed")
+  else
+    deps.task.transition(t, deps.task.FAILED,
+      "testing failed (no retries left): " .. #failed .. " skill(s) failed")
+  end
+
+  return t
+end
+
+-- ---------------------------------------------------------------------------
 -- Dispatch table
 -- ---------------------------------------------------------------------------
 
@@ -173,7 +255,8 @@ local HANDLERS = {
   [("pending")]    = handle_pending,
   [("planning")]   = handle_planning,
   [("executing")]  = handle_executing,
-  -- Remaining handlers (testing, approval, replanning) added in 3c+.
+  [("testing")]    = handle_testing,
+  -- Remaining handlers (approval, replanning) added in 3d+.
 }
 
 -- ---------------------------------------------------------------------------

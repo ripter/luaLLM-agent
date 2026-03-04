@@ -208,14 +208,15 @@ end)
 -- ---------------------------------------------------------------------------
 
 describe("agent.step on unhandled status", function()
-  -- Use TESTING: it has no handler yet (added in Step 3c+).
+  -- Use REPLANNING: it has no handler yet (added in Step 3d+).
+  -- Walk there via raw task.transition calls to bypass handlers.
 
   it("returns nil + error for an unimplemented status", function()
-    local deps   = ok_deps()
-    local t      = mocks.make_task_obj()
+    local deps = ok_deps()
+    local t    = mocks.make_task_obj()
     task.transition(t, task.PLANNING)
     task.transition(t, task.EXECUTING)
-    task.transition(t, task.TESTING)
+    task.transition(t, task.REPLANNING)
     local result, err = agent.step(deps, t)
     assert.is_nil(result)
     assert.is_truthy(err:find("no handler", 1, true))
@@ -226,9 +227,9 @@ describe("agent.step on unhandled status", function()
     local t    = mocks.make_task_obj()
     task.transition(t, task.PLANNING)
     task.transition(t, task.EXECUTING)
-    task.transition(t, task.TESTING)
+    task.transition(t, task.REPLANNING)
     local _, err = agent.step(deps, t)
-    assert.is_truthy(err:find(task.TESTING, 1, true))
+    assert.is_truthy(err:find(task.REPLANNING, 1, true))
   end)
 
 end)
@@ -526,6 +527,252 @@ describe("agent.step on EXECUTING task (cmd_plan fails)", function()
     agent.step(deps, t)
     -- skill_files should remain untouched (empty default)
     assert.same({}, t.skill_files)
+  end)
+
+end)
+
+-- ===========================================================================
+-- Step 3c — handle_testing tests
+-- ===========================================================================
+
+-- ---------------------------------------------------------------------------
+-- Helpers specific to 3c
+-- ---------------------------------------------------------------------------
+
+--- Build a task already at TESTING status with skill_files populated.
+local function testing_task(skill_files, overrides)
+  overrides   = overrides or {}
+  local t = mocks.make_task_obj({ prompt = overrides.prompt or "do something" })
+  task.transition(t, task.PLANNING)
+  task.transition(t, task.EXECUTING)
+  task.transition(t, task.TESTING)
+  t.skill_files = skill_files or {}
+  if overrides.attempts_test then
+    t.attempts.test = overrides.attempts_test
+  end
+  return t
+end
+
+--- Shorthand: deps where all run_tests calls pass by default.
+local function testing_ok_deps(overrides)
+  return mocks.make_agent_deps(overrides or {})
+end
+
+--- Shorthand: deps where run_tests returns specific per-path results.
+local function testing_deps_with_results(results_map)
+  return mocks.make_agent_deps({
+    skill_runner_overrides = { results = results_map },
+  })
+end
+
+-- ---------------------------------------------------------------------------
+-- handle_testing — all tests pass → APPROVAL
+-- ---------------------------------------------------------------------------
+
+describe("agent.step on TESTING task (all tests pass)", function()
+
+  it("transitions to APPROVAL when all skill tests pass", function()
+    local deps = testing_ok_deps()
+    local t    = testing_task({ "src/skill_a.lua" })
+    agent.step(deps, t)
+    assert.equals(task.APPROVAL, t.status)
+  end)
+
+  it("transitions to APPROVAL with multiple passing skills", function()
+    local deps = testing_ok_deps()
+    local t    = testing_task({ "src/skill_a.lua", "src/skill_b.lua" })
+    agent.step(deps, t)
+    assert.equals(task.APPROVAL, t.status)
+  end)
+
+  it("calls skill_runner.run_tests for each skill file", function()
+    local deps = testing_ok_deps()
+    local t    = testing_task({ "src/skill_a.lua", "src/skill_b.lua" })
+    agent.step(deps, t)
+    assert.equals(2, #deps.skill_runner._calls)
+  end)
+
+  it("calls run_tests with the .test.lua path derived from each skill path", function()
+    local deps = testing_ok_deps()
+    local t    = testing_task({ "src/skill_a.lua" })
+    agent.step(deps, t)
+    assert.equals("src/skill_a.test.lua", deps.skill_runner._calls[1])
+  end)
+
+  it("populates t.test_results with one entry per skill", function()
+    local deps = testing_ok_deps()
+    local t    = testing_task({ "src/skill_a.lua", "src/skill_b.lua" })
+    agent.step(deps, t)
+    assert.equals(2, #t.test_results)
+  end)
+
+  it("each test_result entry records skill_path, test_path, and passed=true", function()
+    local deps = testing_ok_deps()
+    local t    = testing_task({ "src/skill_a.lua" })
+    agent.step(deps, t)
+    local r = t.test_results[1]
+    assert.equals("src/skill_a.lua",      r.skill_path)
+    assert.equals("src/skill_a.test.lua", r.test_path)
+    assert.is_true(r.passed)
+  end)
+
+  it("transitions to APPROVAL with no skills (empty skill_files)", function()
+    -- If TESTING is somehow entered with no skill_files, all-pass vacuously.
+    local deps = testing_ok_deps()
+    local t    = testing_task({})
+    agent.step(deps, t)
+    assert.equals(task.APPROVAL, t.status)
+  end)
+
+end)
+
+-- ---------------------------------------------------------------------------
+-- handle_testing — test failure, retries left → REPLANNING
+-- ---------------------------------------------------------------------------
+
+describe("agent.step on TESTING task (test fails, retries left)", function()
+
+  it("transitions to REPLANNING when a test fails and retries remain", function()
+    local deps = testing_deps_with_results({
+      ["src/skill_a.test.lua"] = { passed = false, output = "FAILED: assertion #1" },
+    })
+    local t = testing_task({ "src/skill_a.lua" })
+    -- attempts.test = 0, max = 2 → after bump = 1 < 2
+    agent.step(deps, t)
+    assert.equals(task.REPLANNING, t.status)
+  end)
+
+  it("sets t.error containing test output on failure", function()
+    local deps = testing_deps_with_results({
+      ["src/skill_a.test.lua"] = { passed = false, output = "FAILED: assertion #1" },
+    })
+    local t = testing_task({ "src/skill_a.lua" })
+    agent.step(deps, t)
+    assert.is_truthy(t.error:find("FAILED: assertion #1", 1, true))
+  end)
+
+  it("bumps attempts.test counter on failure", function()
+    local deps = testing_deps_with_results({
+      ["src/skill_a.test.lua"] = { passed = false, output = "FAILED" },
+    })
+    local t = testing_task({ "src/skill_a.lua" })
+    agent.step(deps, t)
+    assert.equals(1, t.attempts.test)
+  end)
+
+  it("t.test_results records passed=false for the failing skill", function()
+    local deps = testing_deps_with_results({
+      ["src/skill_a.test.lua"] = { passed = false, output = "FAILED" },
+    })
+    local t = testing_task({ "src/skill_a.lua" })
+    agent.step(deps, t)
+    assert.is_false(t.test_results[1].passed)
+  end)
+
+end)
+
+-- ---------------------------------------------------------------------------
+-- handle_testing — test failure, no retries → FAILED
+-- ---------------------------------------------------------------------------
+
+describe("agent.step on TESTING task (test fails, no retries)", function()
+
+  it("transitions to FAILED when no retries remain", function()
+    local deps = testing_deps_with_results({
+      ["src/skill_a.test.lua"] = { passed = false, output = "FAILED" },
+    })
+    local t = testing_task({ "src/skill_a.lua" }, { attempts_test = 2 })
+    -- attempts.test = 2 == max_attempts.test → can_retry = false after bump
+    agent.step(deps, t)
+    assert.equals(task.FAILED, t.status)
+  end)
+
+  it("sets t.error on failure with no retries", function()
+    local deps = testing_deps_with_results({
+      ["src/skill_a.test.lua"] = { passed = false, output = "nothing left" },
+    })
+    local t = testing_task({ "src/skill_a.lua" }, { attempts_test = 2 })
+    agent.step(deps, t)
+    assert.is_string(t.error)
+    assert.is_truthy(t.error:find("nothing left", 1, true))
+  end)
+
+end)
+
+-- ---------------------------------------------------------------------------
+-- handle_testing — hard failure from run_tests (missing test file)
+-- ---------------------------------------------------------------------------
+
+describe("agent.step on TESTING task (run_tests hard failure)", function()
+
+  it("treats a missing test file as a test failure (retries → REPLANNING)", function()
+    -- skill_runner returns nil + error_string for the test path
+    local deps = mocks.make_agent_deps({
+      skill_runner_overrides = {
+        results = {
+          ["src/skill_a.test.lua"] = "file not found: src/skill_a.test.lua",
+        },
+      },
+    })
+    local t = testing_task({ "src/skill_a.lua" })
+    agent.step(deps, t)
+    -- Hard failure is folded into the normal failure path; retries remain → REPLANNING
+    assert.equals(task.REPLANNING, t.status)
+  end)
+
+  it("records the hard-failure message in t.test_results output", function()
+    local deps = mocks.make_agent_deps({
+      skill_runner_overrides = {
+        results = {
+          ["src/skill_a.test.lua"] = "file not found: src/skill_a.test.lua",
+        },
+      },
+    })
+    local t = testing_task({ "src/skill_a.lua" })
+    agent.step(deps, t)
+    assert.is_truthy(t.test_results[1].output:find("file not found", 1, true))
+  end)
+
+end)
+
+-- ---------------------------------------------------------------------------
+-- handle_testing — multiple skills, mixed results
+-- ---------------------------------------------------------------------------
+
+describe("agent.step on TESTING task (multiple skills, mixed pass/fail)", function()
+
+  it("transitions to REPLANNING when at least one skill fails", function()
+    local deps = testing_deps_with_results({
+      ["src/skill_a.test.lua"] = { passed = true,  output = "ok" },
+      ["src/skill_b.test.lua"] = { passed = false, output = "FAILED" },
+    })
+    local t = testing_task({ "src/skill_a.lua", "src/skill_b.lua" })
+    agent.step(deps, t)
+    assert.equals(task.REPLANNING, t.status)
+  end)
+
+  it("t.test_results reflects individual pass/fail per skill", function()
+    local deps = testing_deps_with_results({
+      ["src/skill_a.test.lua"] = { passed = true,  output = "ok" },
+      ["src/skill_b.test.lua"] = { passed = false, output = "FAILED" },
+    })
+    local t = testing_task({ "src/skill_a.lua", "src/skill_b.lua" })
+    agent.step(deps, t)
+    -- Find results by skill_path regardless of order.
+    local by_skill = {}
+    for _, r in ipairs(t.test_results) do by_skill[r.skill_path] = r end
+    assert.is_true(by_skill["src/skill_a.lua"].passed)
+    assert.is_false(by_skill["src/skill_b.lua"].passed)
+  end)
+
+  it("t.error only mentions the failing skill", function()
+    local deps = testing_deps_with_results({
+      ["src/skill_a.test.lua"] = { passed = true,  output = "ok" },
+      ["src/skill_b.test.lua"] = { passed = false, output = "skill_b exploded" },
+    })
+    local t = testing_task({ "src/skill_a.lua", "src/skill_b.lua" })
+    agent.step(deps, t)
+    assert.is_truthy(t.error:find("skill_b", 1, true))
   end)
 
 end)

@@ -358,6 +358,54 @@ function M.make_skill_loader(overrides)
 end
 
 -- ---------------------------------------------------------------------------
+-- skill_runner mock factory
+-- ---------------------------------------------------------------------------
+
+--- Build a stub skill_runner module for agent tests.
+--- `results` maps test_path → result table (or error string for hard failure).
+--- A result table shape: { passed=bool, output=string, exit_code=int, timed_out=bool }
+--- If a path is not in the map, run_tests returns a passing result by default.
+--- Supported overrides:
+---   results  — map of test_path -> { passed, output } or error_string
+---   default_passed — boolean, controls default when path not in results (default: true)
+--- Tracks all run_tests calls in ._calls.
+function M.make_skill_runner(overrides)
+  overrides = overrides or {}
+  local result_map    = overrides.results       or {}
+  local default_pass  = overrides.default_passed
+  if default_pass == nil then default_pass = true end
+  local calls = {}
+
+  return {
+    run_tests = function(test_path, _timeout)
+      calls[#calls + 1] = test_path
+      local r = result_map[test_path]
+      if r == nil then
+        -- Default: passing result.
+        return {
+          passed    = default_pass,
+          output    = default_pass and "ok" or "FAILED",
+          exit_code = default_pass and 0 or 1,
+          timed_out = false,
+        }, nil
+      end
+      if type(r) == "string" then
+        -- Hard failure (e.g. file not found).
+        return nil, r
+      end
+      -- Explicit result table.
+      return {
+        passed    = r.passed,
+        output    = r.output    or "",
+        exit_code = r.exit_code or (r.passed and 0 or 1),
+        timed_out = r.timed_out or false,
+      }, nil
+    end,
+    _calls = calls,
+  }
+end
+
+-- ---------------------------------------------------------------------------
 -- Planner-specific mock factory
 -- ---------------------------------------------------------------------------
 
@@ -420,8 +468,9 @@ end
 --- Supported overrides:
 ---   planner_overrides      — forwarded to make_planner
 ---   plan_mod_overrides     — forwarded to make_plan_mod
----   cmd_plan_overrides     — forwarded to make_cmd_plan
----   skill_loader_overrides — forwarded to make_skill_loader
+---   cmd_plan_overrides      — forwarded to make_cmd_plan
+---   skill_loader_overrides  — forwarded to make_skill_loader
+---   skill_runner_overrides  — forwarded to make_skill_runner
 ---   config_overrides / luallm_overrides / safe_fs_overrides — pass-through
 function M.make_agent_deps(overrides)
   overrides = overrides or {}
@@ -441,7 +490,7 @@ function M.make_agent_deps(overrides)
     plan         = overrides.plan         or M.make_plan_mod(plan_tbl, overrides.plan_mod_overrides or {}),
     cmd_plan     = overrides.cmd_plan     or M.make_cmd_plan(overrides.cmd_plan_overrides or {}),
     skill_loader = overrides.skill_loader or M.make_skill_loader(overrides.skill_loader_overrides or {}),
-    skill_runner = overrides.skill_runner,
+    skill_runner = overrides.skill_runner or M.make_skill_runner(overrides.skill_runner_overrides or {}),
     approval     = overrides.approval,
     config       = base_deps.config,
     luallm       = base_deps.luallm,
