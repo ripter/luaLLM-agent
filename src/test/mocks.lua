@@ -174,6 +174,10 @@ end
 function M.make_plan_mod(plan_table, overrides)
   overrides = overrides or {}
   return {
+    parse = function(_text)
+      if overrides.parse_err then return nil, overrides.parse_err end
+      return plan_table, nil
+    end,
     load_file = function(_path)
       if overrides.load_err then return nil, overrides.load_err end
       return plan_table, nil
@@ -301,6 +305,98 @@ function M.make_plan_deps(overrides)
   }
 
   return deps, gen_ctx, lines
+end
+
+-- ---------------------------------------------------------------------------
+-- Planner-specific mock factory
+-- ---------------------------------------------------------------------------
+
+--- Build a stub planner module for agent tests.
+--- Supported overrides:
+---   generate_err   — error string; causes generate() to return nil + err
+---   generate_path  — plan_path returned on success (default: "./plan.md")
+---   replan_err     — error string; causes replan() to return nil + err
+---   replan_path    — plan_path returned on success (default: "./plan.md")
+--- Also tracks calls in ._generate_calls and ._replan_calls.
+function M.make_planner(overrides)
+  overrides = overrides or {}
+  local generate_calls = {}
+  local replan_calls   = {}
+
+  return {
+    generate = function(_deps, prompt, opts)
+      generate_calls[#generate_calls + 1] = { prompt = prompt, opts = opts }
+      if overrides.generate_err then return nil, overrides.generate_err end
+      local path = overrides.generate_path or "./plan.md"
+      return path, M.make_plan({ prompt = prompt })
+    end,
+
+    replan = function(_deps, task_obj, error_info, opts)
+      replan_calls[#replan_calls + 1] = { task = task_obj, error_info = error_info, opts = opts }
+      if overrides.replan_err then return nil, overrides.replan_err end
+      local path = overrides.replan_path or "./plan.md"
+      return path, M.make_plan({ prompt = task_obj and task_obj.prompt or "" })
+    end,
+
+    system_prompt = function() return "stub system prompt" end,
+
+    _generate_calls = generate_calls,
+    _replan_calls   = replan_calls,
+  }
+end
+
+-- ---------------------------------------------------------------------------
+-- Agent deps factory
+-- ---------------------------------------------------------------------------
+
+--- Build a task table for agent tests using the real task module.
+--- Uses a fixed uuid so tests are deterministic.
+function M.make_task_obj(overrides)
+  overrides = overrides or {}
+  local task_mod = require("task")
+  local t = task_mod.new(
+    overrides.prompt or "do something",
+    function() return overrides.id or "test-task-id" end
+  )
+  for k, v in pairs(overrides) do
+    if k ~= "prompt" and k ~= "id" then
+      t[k] = v
+    end
+  end
+  return t
+end
+
+--- Build a full deps table for agent tests.
+--- Supported overrides:
+---   planner_overrides  — forwarded to make_planner
+---   plan_mod_overrides — forwarded to make_plan_mod
+---   config_overrides / luallm_overrides / safe_fs_overrides — pass-through
+function M.make_agent_deps(overrides)
+  overrides = overrides or {}
+
+  local base_deps, written = M.make_deps({
+    luallm_overrides  = overrides.luallm_overrides,
+    safe_fs_overrides = overrides.safe_fs_overrides,
+    config_overrides  = overrides.config_overrides,
+  })
+
+  local plan_tbl = M.make_plan(overrides.plan_overrides)
+  local task_mod = require("task")
+
+  local deps = {
+    task         = task_mod,
+    planner      = overrides.planner or M.make_planner(overrides.planner_overrides or {}),
+    plan         = overrides.plan    or M.make_plan_mod(plan_tbl, overrides.plan_mod_overrides or {}),
+    cmd_plan     = overrides.cmd_plan,
+    skill_runner = overrides.skill_runner,
+    approval     = overrides.approval,
+    config       = base_deps.config,
+    luallm       = base_deps.luallm,
+    safe_fs      = base_deps.safe_fs,
+    print        = overrides.print or function(_) end,
+  }
+
+  return deps, written
 end
 
 return M
