@@ -208,10 +208,14 @@ end)
 -- ---------------------------------------------------------------------------
 
 describe("agent.step on unhandled status", function()
+  -- Use TESTING: it has no handler yet (added in Step 3c+).
 
   it("returns nil + error for an unimplemented status", function()
     local deps   = ok_deps()
-    local t      = task_at(task.EXECUTING)
+    local t      = mocks.make_task_obj()
+    task.transition(t, task.PLANNING)
+    task.transition(t, task.EXECUTING)
+    task.transition(t, task.TESTING)
     local result, err = agent.step(deps, t)
     assert.is_nil(result)
     assert.is_truthy(err:find("no handler", 1, true))
@@ -219,9 +223,12 @@ describe("agent.step on unhandled status", function()
 
   it("error mentions the current status", function()
     local deps = ok_deps()
-    local t    = task_at(task.EXECUTING)
+    local t    = mocks.make_task_obj()
+    task.transition(t, task.PLANNING)
+    task.transition(t, task.EXECUTING)
+    task.transition(t, task.TESTING)
     local _, err = agent.step(deps, t)
-    assert.is_truthy(err:find(task.EXECUTING, 1, true))
+    assert.is_truthy(err:find(task.TESTING, 1, true))
   end)
 
 end)
@@ -315,6 +322,210 @@ describe("agent.resume", function()
     assert.is_nil(result)
     assert.is_truthy(err:find("not paused", 1, true) or err:find("APPROVAL", 1, true)
                      or err:find("approval", 1, true))
+  end)
+
+end)
+
+-- ===========================================================================
+-- Step 3b — handle_executing tests
+-- ===========================================================================
+
+-- ---------------------------------------------------------------------------
+-- Helpers specific to 3b
+-- ---------------------------------------------------------------------------
+
+--- Build a task already at EXECUTING status with a plan_path set.
+local function executing_task(overrides)
+  overrides = overrides or {}
+  local t = mocks.make_task_obj({ prompt = overrides.prompt or "do something" })
+  task.transition(t, task.PLANNING)
+  task.transition(t, task.EXECUTING)
+  t.plan_path = overrides.plan_path or "./plan.md"
+  if overrides.attempts_plan then
+    t.attempts.plan = overrides.attempts_plan
+  end
+  return t
+end
+
+--- Shorthand: deps where cmd_plan succeeds and no outputs are skills.
+local function exec_ok_deps(overrides)
+  overrides = overrides or {}
+  -- plan_mod.load_file returns a plan with the given outputs list.
+  local outputs = overrides.outputs or {}
+  return mocks.make_agent_deps({
+    plan_overrides         = { outputs = outputs },
+    skill_loader_overrides = overrides.skill_loader_overrides or { skill_paths = {} },
+    cmd_plan_overrides     = overrides.cmd_plan_overrides or {},
+  })
+end
+
+--- Shorthand: deps where cmd_plan fails.
+local function exec_fail_deps(err_msg)
+  return mocks.make_agent_deps({
+    cmd_plan_overrides = { run_err = err_msg or "generate exploded" },
+  })
+end
+
+-- ---------------------------------------------------------------------------
+-- handle_executing — cmd_plan success, no skills → COMPLETE
+-- ---------------------------------------------------------------------------
+
+describe("agent.step on EXECUTING task (cmd_plan succeeds, no skills)", function()
+
+  it("transitions to COMPLETE", function()
+    local deps = exec_ok_deps()
+    local t    = executing_task()
+    agent.step(deps, t)
+    assert.equals(task.COMPLETE, t.status)
+  end)
+
+  it("calls cmd_plan.run exactly once", function()
+    local deps = exec_ok_deps()
+    local t    = executing_task()
+    agent.step(deps, t)
+    assert.equals(1, #deps.cmd_plan._calls)
+  end)
+
+  it("calls cmd_plan.run with subcommand=run and the task's plan_path", function()
+    local deps = exec_ok_deps()
+    local t    = executing_task({ plan_path = "/tmp/my_plan.md" })
+    agent.step(deps, t)
+    local call_args = deps.cmd_plan._calls[1].args
+    assert.equals("run",             call_args.subcommand)
+    assert.equals("/tmp/my_plan.md", call_args.plan_path)
+  end)
+
+  it("passes a deps table to cmd_plan.run (not nil)", function()
+    local deps = exec_ok_deps()
+    local t    = executing_task()
+    agent.step(deps, t)
+    assert.is_table(deps.cmd_plan._calls[1].deps)
+  end)
+
+  it("t.skill_files is empty when no outputs are skills", function()
+    local deps = exec_ok_deps({ outputs = { "src/out.lua" } })
+    local t    = executing_task()
+    agent.step(deps, t)
+    assert.same({}, t.skill_files)
+  end)
+
+  it("calls skill_loader.parse_metadata for each declared output", function()
+    local outputs = { "src/a.lua", "src/b.lua" }
+    local deps    = exec_ok_deps({ outputs = outputs })
+    local t       = executing_task()
+    agent.step(deps, t)
+    -- parse_metadata must have been called once per output
+    assert.equals(#outputs, #deps.skill_loader._calls)
+  end)
+
+  it("parse_metadata is called with each output path", function()
+    local outputs = { "src/a.lua", "src/b.lua" }
+    local deps    = exec_ok_deps({ outputs = outputs })
+    local t       = executing_task()
+    agent.step(deps, t)
+    -- Calls may be in any order; use a set check.
+    local seen = {}
+    for _, p in ipairs(deps.skill_loader._calls) do seen[p] = true end
+    for _, p in ipairs(outputs) do
+      assert.is_true(seen[p], "expected parse_metadata call for " .. p)
+    end
+  end)
+
+end)
+
+-- ---------------------------------------------------------------------------
+-- handle_executing — cmd_plan success, skills found → TESTING
+-- ---------------------------------------------------------------------------
+
+describe("agent.step on EXECUTING task (cmd_plan succeeds, skills found)", function()
+
+  it("transitions to TESTING when at least one output is a skill", function()
+    local outputs = { "src/my_skill.lua", "src/helper.lua" }
+    local deps    = exec_ok_deps({
+      outputs                = outputs,
+      skill_loader_overrides = { skill_paths = { "src/my_skill.lua" } },
+    })
+    local t = executing_task()
+    agent.step(deps, t)
+    assert.equals(task.TESTING, t.status)
+  end)
+
+  it("t.skill_files contains only the skill output(s)", function()
+    local outputs = { "src/my_skill.lua", "src/helper.lua" }
+    local deps    = exec_ok_deps({
+      outputs                = outputs,
+      skill_loader_overrides = { skill_paths = { "src/my_skill.lua" } },
+    })
+    local t = executing_task()
+    agent.step(deps, t)
+    assert.same({ "src/my_skill.lua" }, t.skill_files)
+  end)
+
+  it("t.skill_files contains all skills when multiple outputs are skills", function()
+    local outputs = { "src/skill_a.lua", "src/skill_b.lua" }
+    local deps    = exec_ok_deps({
+      outputs                = outputs,
+      skill_loader_overrides = { skill_paths = outputs },
+    })
+    local t = executing_task()
+    agent.step(deps, t)
+    assert.equals(2, #t.skill_files)
+  end)
+
+  it("t.outputs is populated from plan outputs", function()
+    local outputs = { "src/my_skill.lua" }
+    local deps    = exec_ok_deps({
+      outputs                = outputs,
+      skill_loader_overrides = { skill_paths = outputs },
+    })
+    local t = executing_task()
+    agent.step(deps, t)
+    assert.same(outputs, t.outputs)
+  end)
+
+end)
+
+-- ---------------------------------------------------------------------------
+-- handle_executing — cmd_plan failure
+-- ---------------------------------------------------------------------------
+
+describe("agent.step on EXECUTING task (cmd_plan fails)", function()
+
+  it("transitions to REPLANNING when retries remain", function()
+    local deps = exec_fail_deps("generate exploded")
+    local t    = executing_task()
+    -- attempts.plan = 0, max = 3 → can_retry = true
+    agent.step(deps, t)
+    assert.equals(task.REPLANNING, t.status)
+  end)
+
+  it("transitions to FAILED when no retries remain", function()
+    local deps = exec_fail_deps("generate exploded")
+    local t    = executing_task({ attempts_plan = 3 })  -- exhausted
+    agent.step(deps, t)
+    assert.equals(task.FAILED, t.status)
+  end)
+
+  it("sets t.error on failure", function()
+    local deps = exec_fail_deps("generate exploded")
+    local t    = executing_task()
+    agent.step(deps, t)
+    assert.is_truthy(t.error:find("generate exploded", 1, true))
+  end)
+
+  it("does not call skill_loader.parse_metadata on failure", function()
+    local deps = exec_fail_deps("oops")
+    local t    = executing_task()
+    agent.step(deps, t)
+    assert.equals(0, #deps.skill_loader._calls)
+  end)
+
+  it("does not transition skill_files on failure", function()
+    local deps = exec_fail_deps("oops")
+    local t    = executing_task()
+    agent.step(deps, t)
+    -- skill_files should remain untouched (empty default)
+    assert.same({}, t.skill_files)
   end)
 
 end)

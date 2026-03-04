@@ -308,6 +308,56 @@ function M.make_plan_deps(overrides)
 end
 
 -- ---------------------------------------------------------------------------
+-- cmd_plan mock factory
+-- ---------------------------------------------------------------------------
+
+--- Build a stub cmd_plan module for agent tests.
+--- Supported overrides:
+---   run_err  — error string; causes run() to return nil + err
+--- Tracks all calls in ._calls.
+function M.make_cmd_plan(overrides)
+  overrides = overrides or {}
+  local calls = {}
+  return {
+    run = function(args, deps)
+      calls[#calls + 1] = { args = args, deps = deps }
+      if overrides.run_err then return nil, overrides.run_err end
+      return true, nil
+    end,
+    _calls = calls,
+  }
+end
+
+-- ---------------------------------------------------------------------------
+-- skill_loader mock factory
+-- ---------------------------------------------------------------------------
+
+--- Build a stub skill_loader module for agent tests.
+--- `skill_paths` is a list of output paths that should be recognised as skills.
+--- Any path in the list returns a minimal metadata table; others return nil.
+--- Supported overrides:
+---   skill_paths — list of paths that parse successfully as skills (default: {})
+--- Tracks all parse_metadata calls in ._calls.
+function M.make_skill_loader(overrides)
+  overrides   = overrides or {}
+  local skill_set = {}
+  for _, p in ipairs(overrides.skill_paths or {}) do
+    skill_set[p] = true
+  end
+  local calls = {}
+  return {
+    parse_metadata = function(path)
+      calls[#calls + 1] = path
+      if skill_set[path] then
+        return { name = path, paths = {}, dependencies = {}, public_functions = {} }, nil
+      end
+      return nil, "not a skill: " .. tostring(path)
+    end,
+    _calls = calls,
+  }
+end
+
+-- ---------------------------------------------------------------------------
 -- Planner-specific mock factory
 -- ---------------------------------------------------------------------------
 
@@ -368,8 +418,10 @@ end
 
 --- Build a full deps table for agent tests.
 --- Supported overrides:
----   planner_overrides  — forwarded to make_planner
----   plan_mod_overrides — forwarded to make_plan_mod
+---   planner_overrides      — forwarded to make_planner
+---   plan_mod_overrides     — forwarded to make_plan_mod
+---   cmd_plan_overrides     — forwarded to make_cmd_plan
+---   skill_loader_overrides — forwarded to make_skill_loader
 ---   config_overrides / luallm_overrides / safe_fs_overrides — pass-through
 function M.make_agent_deps(overrides)
   overrides = overrides or {}
@@ -385,9 +437,10 @@ function M.make_agent_deps(overrides)
 
   local deps = {
     task         = task_mod,
-    planner      = overrides.planner or M.make_planner(overrides.planner_overrides or {}),
-    plan         = overrides.plan    or M.make_plan_mod(plan_tbl, overrides.plan_mod_overrides or {}),
-    cmd_plan     = overrides.cmd_plan,
+    planner      = overrides.planner      or M.make_planner(overrides.planner_overrides or {}),
+    plan         = overrides.plan         or M.make_plan_mod(plan_tbl, overrides.plan_mod_overrides or {}),
+    cmd_plan     = overrides.cmd_plan     or M.make_cmd_plan(overrides.cmd_plan_overrides or {}),
+    skill_loader = overrides.skill_loader or M.make_skill_loader(overrides.skill_loader_overrides or {}),
     skill_runner = overrides.skill_runner,
     approval     = overrides.approval,
     config       = base_deps.config,

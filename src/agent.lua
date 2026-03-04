@@ -4,7 +4,8 @@
 --- delegating to planner, cmd_plan, skill_runner, and approval.
 ---
 --- Build order: handlers are added one step at a time (3a, 3b, …).
---- Only handle_pending and handle_planning are implemented here (Step 3a).
+--- Step 3a: handle_pending, handle_planning.
+--- Step 3b: handle_executing.
 
 local _src = debug.getinfo(1, "S").source:match("^@(.*/)") or "./"
 package.path = _src .. "?.lua;" .. package.path
@@ -21,6 +22,7 @@ local function default_deps()
     planner      = require("planner"),
     cmd_plan     = require("cmd_plan"),
     plan         = require("plan"),
+    skill_loader = require("skill_loader"),
     skill_runner = require("skill_runner"),
     approval     = require("approval"),
     config       = require("config"),
@@ -88,13 +90,90 @@ local function handle_planning(deps, t)
 end
 
 -- ---------------------------------------------------------------------------
+-- Handler: EXECUTING → TESTING | COMPLETE | REPLANNING | FAILED
+-- ---------------------------------------------------------------------------
+
+--- Build the deps table that cmd_plan.run() expects, bridging from agent deps.
+local function make_cmd_plan_deps(deps)
+  return {
+    plan                 = deps.plan,
+    globber              = deps.plan.default_globber,
+    cmd_generate_context = deps.cmd_generate_context,
+    cmd_generate         = deps.cmd_generate,
+    luallm               = deps.luallm,
+    safe_fs              = deps.safe_fs,
+    config               = deps.config,
+    fs                   = deps.fs or { exists = function(_) return false end },
+    print                = deps.print or function(_) end,
+  }
+end
+
+local function handle_executing(deps, t)
+  local plan_deps = make_cmd_plan_deps(deps)
+
+  local ok, err = deps.cmd_plan.run(
+    { subcommand = "run", plan_path = t.plan_path },
+    plan_deps
+  )
+
+  if not ok then
+    err = tostring(err)
+    t.error = err
+
+    if deps.task.can_retry(t, "plan") then
+      deps.task.transition(t, deps.task.REPLANNING,
+        "execution failed (will retry): " .. err)
+    else
+      deps.task.transition(t, deps.task.FAILED,
+        "execution failed (no retries left): " .. err)
+    end
+
+    return t
+  end
+
+  -- Execution succeeded.  Collect declared outputs from the plan.
+  -- We re-load the plan to get the outputs list; fall back to t.outputs if set.
+  local plan_table
+  if deps.plan and t.plan_path then
+    local pt, _ = deps.plan.load_file(t.plan_path)
+    plan_table = pt
+  end
+
+  local output_paths = (plan_table and plan_table.outputs) or t.outputs or {}
+  t.outputs = output_paths
+
+  -- Scan each output for @skill metadata.  Any file that parses successfully
+  -- as a skill is added to t.skill_files.
+  local skill_files = {}
+  for _, path in ipairs(output_paths) do
+    local meta, _ = deps.skill_loader.parse_metadata(path)
+    if meta then
+      skill_files[#skill_files + 1] = path
+    end
+  end
+
+  t.skill_files = skill_files
+
+  if #skill_files > 0 then
+    deps.task.transition(t, deps.task.TESTING,
+      "execution complete, skills found: " .. #skill_files)
+  else
+    deps.task.transition(t, deps.task.COMPLETE,
+      "execution complete, no skills (pure codegen)")
+  end
+
+  return t
+end
+
+-- ---------------------------------------------------------------------------
 -- Dispatch table
 -- ---------------------------------------------------------------------------
 
 local HANDLERS = {
   [("pending")]    = handle_pending,
   [("planning")]   = handle_planning,
-  -- Remaining handlers (executing, testing, approval, replanning) added in 3b+.
+  [("executing")]  = handle_executing,
+  -- Remaining handlers (testing, approval, replanning) added in 3c+.
 }
 
 -- ---------------------------------------------------------------------------
