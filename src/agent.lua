@@ -10,6 +10,7 @@
 --- Step 3d: handle_approval.
 --- Step 3e: handle_replanning.
 --- Step 3f: agent.resume (promotion flow).
+--- Step 3g: agent.run() wired end-to-end.
 
 local _src = debug.getinfo(1, "S").source:match("^@(.*/)") or "./"
 package.path = _src .. "?.lua;" .. package.path
@@ -178,7 +179,7 @@ local function handle_executing(deps, t)
 end
 
 -- ---------------------------------------------------------------------------
--- Handler: TESTING → APPROVAL | REPLANNING | FAILED
+-- Internal helpers: skill path conventions
 -- ---------------------------------------------------------------------------
 
 --- Derive the test file path from a skill file path.
@@ -186,6 +187,84 @@ end
 local function test_path_for(skill_path)
   return (skill_path:gsub("%.lua$", ".test.lua"))
 end
+
+--- Extract the skill name from a skill file path.
+--- Convention: "path/to/my_skill.lua" -> "my_skill"
+local function skill_name_for(skill_path)
+  local base = skill_path:match("([^/]+)$") or skill_path
+  return (base:gsub("%.lua$", ""))
+end
+
+--- Find the test_results entry for a given skill_path (nil if absent).
+local function results_for(test_results, skill_path)
+  if type(test_results) ~= "table" then return nil end
+  for _, r in ipairs(test_results) do
+    if r.skill_path == skill_path then return r end
+  end
+  return nil
+end
+
+--- Create approval records for all skills in t.skill_files.
+--- Sets t.approval_id (first record's id).
+--- Prints promotion commands.
+--- Returns true on success, or transitions t to FAILED and returns false.
+local function create_approval_records(deps, t)
+  local emit        = deps.print or function(_) end
+  local allowed_dir = deps.config.get("skills.allowed_dir") or "./skills"
+  local approval_ids = {}
+
+  for _, skill_path in ipairs(t.skill_files or {}) do
+    local skill_name = skill_name_for(skill_path)
+    local test_path  = test_path_for(skill_path)
+
+    local skill_results     = results_for(t.test_results, skill_path)
+    local test_results_arg  = skill_results and { skill_results } or {}
+
+    local metadata = nil
+    if deps.skill_loader then
+      local meta, _ = deps.skill_loader.parse_metadata(skill_path)
+      metadata = meta
+    end
+
+    local record, err = deps.approval.create(
+      skill_name, skill_path, test_path, test_results_arg, metadata or {}
+    )
+
+    if not record then
+      deps.task.transition(t, deps.task.FAILED,
+        "approval.create failed for '" .. skill_path .. "': " .. tostring(err))
+      return false
+    end
+
+    approval_ids[#approval_ids + 1] = record.id
+
+    local cmds, cmds_err = deps.approval.get_promotion_commands(record, allowed_dir)
+    if cmds then
+      emit("")
+      emit("  Promote '" .. skill_name .. "':")
+      for _, cmd in ipairs(cmds) do emit("    " .. cmd) end
+    else
+      emit("  (could not generate promotion commands: " .. tostring(cmds_err) .. ")")
+    end
+  end
+
+  t.approval_id = approval_ids[1]
+
+  if deps.state and type(deps.state.save) == "function" then
+    deps.state.save(t)
+  end
+
+  emit("")
+  emit("  Task paused for human approval.")
+  emit("  Run the promotion commands above, then:")
+  emit("    ./agent resume")
+
+  return true
+end
+
+-- ---------------------------------------------------------------------------
+-- Handler: TESTING → APPROVAL | REPLANNING | FAILED
+-- ---------------------------------------------------------------------------
 
 local function handle_testing(deps, t)
   local results  = {}
@@ -231,6 +310,9 @@ local function handle_testing(deps, t)
   t.test_results = results
 
   if #failed == 0 then
+    -- All tests passed: create approval records before transitioning to APPROVAL
+    -- so that approval_id is set on the task when run() pauses the loop.
+    create_approval_records(deps, t)
     deps.task.transition(t, deps.task.APPROVAL, "all tests passed")
     return t
   end
@@ -262,89 +344,17 @@ end
 -- Handler: APPROVAL (paused — creates approval records, prints commands)
 -- ---------------------------------------------------------------------------
 
---- Extract the skill name from a skill file path.
---- Convention: "path/to/my_skill.lua" -> "my_skill"
-local function skill_name_for(skill_path)
-  local base = skill_path:match("([^/]+)$") or skill_path
-  return (base:gsub("%.lua$", ""))
-end
-
---- Find the test_results entry for a given skill_path (nil if absent).
-local function results_for(test_results, skill_path)
-  if type(test_results) ~= "table" then return nil end
-  for _, r in ipairs(test_results) do
-    if r.skill_path == skill_path then return r end
-  end
-  return nil
-end
-
+-- handle_approval: called by step() when a task is already in APPROVAL status
+-- (e.g. from direct step() calls in tests, or future re-entry after process restart).
+-- In the normal run() flow, approval records are created by handle_testing via
+-- create_approval_records() before the APPROVAL transition, so this handler is
+-- a no-op that simply returns the paused task.
 local function handle_approval(deps, t)
-  local emit        = deps.print or function(_) end
-  local allowed_dir = deps.config.get("skills.allowed_dir") or "./skills"
-
-  -- Create an approval record for each skill file.
-  local approval_ids = {}
-
-  for _, skill_path in ipairs(t.skill_files or {}) do
-    local skill_name = skill_name_for(skill_path)
-    local test_path  = test_path_for(skill_path)
-
-    -- Gather test results for this skill (may be nil).
-    local skill_results = results_for(t.test_results, skill_path)
-    local test_results_arg = skill_results and { skill_results } or {}
-
-    -- Re-fetch metadata so the record has the full declared paths/deps.
-    local metadata = nil
-    if deps.skill_loader then
-      local meta, _ = deps.skill_loader.parse_metadata(skill_path)
-      metadata = meta
-    end
-
-    local record, err = deps.approval.create(
-      skill_name,
-      skill_path,
-      test_path,
-      test_results_arg,
-      metadata or {}
-    )
-
-    if not record then
-      -- Approval creation failure is a hard error; fail the task.
-      deps.task.transition(t, deps.task.FAILED,
-        "approval.create failed for '" .. skill_path .. "': " .. tostring(err))
-      return t
-    end
-
-    approval_ids[#approval_ids + 1] = record.id
-
-    -- Print promotion commands for this skill.
-    local cmds, cmds_err = deps.approval.get_promotion_commands(record, allowed_dir)
-    if cmds then
-      emit("")
-      emit("  Promote '" .. skill_name .. "':")
-      for _, cmd in ipairs(cmds) do
-        emit("    " .. cmd)
-      end
-    else
-      emit("  (could not generate promotion commands: " .. tostring(cmds_err) .. ")")
-    end
+  -- If approval records haven't been created yet (direct step() call in tests),
+  -- create them now.
+  if not t.approval_id then
+    create_approval_records(deps, t)
   end
-
-  -- Store the first approval_id on the task (primary handle for resume).
-  t.approval_id = approval_ids[1]
-
-  -- Persist task state so it survives process exit.
-  if deps.state and type(deps.state.save) == "function" then
-    deps.state.save(t)
-  end
-
-  emit("")
-  emit("  Task paused for human approval.")
-  emit("  Run the promotion commands above, then:")
-  emit("    ./agent resume")
-
-  -- The task stays in APPROVAL — this is a pause point, not a transition.
-  -- run() will exit the loop because task.is_paused(t) returns true.
   return t
 end
 
@@ -437,14 +447,16 @@ end
 
 --- Create a task from prompt and drive it through the state machine until it
 --- reaches a terminal or paused state (or max_steps is exceeded).
+--- state.save is called after every step so the task survives process exit.
 ---
 --- @param deps   table   Dependency table (see module doc).
 --- @param prompt string  The user's task description.
 --- @param opts   table   Optional:
----                         max_steps     = 20
+---                         max_steps     = 20  (default)
 ---                         context_files = {}
 ---
---- @return table|nil, string  Completed task table, or nil + error_string.
+--- @return task_table  Always returns the task (never nil).
+---         Returns nil, err_string only for invalid arguments.
 function M.run(deps, prompt, opts)
   if type(deps) ~= "table" then
     deps = default_deps()
@@ -460,23 +472,34 @@ function M.run(deps, prompt, opts)
   local t = deps.task.new(prompt)
   t.context_files = opts.context_files or {}
 
-  local steps = 0
-  while not deps.task.is_terminal(t) and not deps.task.is_paused(t) do
-    steps = steps + 1
-    if steps > max_steps then
-      deps.task.transition(t, deps.task.FAILED,
-        "agent.run: exceeded max_steps (" .. max_steps .. ")")
-      break
+  for _ = 1, max_steps do
+    -- Exit before stepping if the task is already at a pause/terminal point.
+    -- This prevents re-entering a handler after it has set a final status.
+    if deps.task.is_terminal(t) then
+      return t
+    end
+    if deps.task.is_paused(t) then
+      return t   -- caller should exit; resume later via agent.resume()
     end
 
-    local result, err = M.step(deps, t)
-    if not result then
-      -- Hard failure from step (unhandled status); fail the task.
-      deps.task.transition(t, deps.task.FAILED, tostring(err))
-      break
+    local ok, err = M.step(deps, t)
+    if not ok then
+      -- Hard failure (unhandled status or internal error); fail the task.
+      t.error = tostring(err)
+      deps.task.transition(t, deps.task.FAILED, t.error)
+    end
+
+    if deps.state and type(deps.state.save) == "function" then
+      deps.state.save(t)
     end
   end
 
+  -- Exhausted max_steps without reaching a terminal/paused state.
+  t.error = "max steps exceeded (" .. max_steps .. ")"
+  deps.task.transition(t, deps.task.FAILED, t.error)
+  if deps.state and type(deps.state.save) == "function" then
+    deps.state.save(t)
+  end
   return t
 end
 

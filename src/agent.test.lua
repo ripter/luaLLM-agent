@@ -237,8 +237,6 @@ describe("agent.run", function()
 
   it("returns a task table", function()
     local deps = ok_deps()
-    -- Planner succeeds → EXECUTING, but EXECUTING has no handler → hard failure
-    -- run() should catch that and mark FAILED, still returning the task.
     local t = agent.run(deps, "do something")
     assert.is_table(t)
   end)
@@ -271,18 +269,12 @@ describe("agent.run", function()
   end)
 
   it("task ends in FAILED when planner always fails and no retries left", function()
-    -- Exhaust retries: max is 3, so fail 3+ times.
-    -- With a plain fail_deps the loop goes PENDING→PLANNING→REPLANNING,
-    -- but REPLANNING has no handler yet → hard failure → FAILED.
     local deps = fail_deps("LLM down")
     local t    = agent.run(deps, "do something")
     assert.equals(task.FAILED, t.status)
   end)
 
   it("respects max_steps safety limit", function()
-    -- With no REPLANNING handler, each step that hits an unhandled state
-    -- causes a hard failure; run() catches it and sets FAILED.
-    -- So just confirm we get a terminal task back regardless.
     local deps = ok_deps()
     local t    = agent.run(deps, "do something", { max_steps = 2 })
     assert.is_true(task.is_terminal(t))
@@ -1516,6 +1508,235 @@ describe("agent.resume when task is not in APPROVAL status", function()
       if line:find(task.PENDING, 1, true) then found = true; break end
     end
     assert.is_true(found, "should mention current status in output")
+  end)
+
+end)
+
+-- ===========================================================================
+-- Step 3g — agent.run() end-to-end integration tests
+-- ===========================================================================
+
+-- ---------------------------------------------------------------------------
+-- Helpers specific to 3g
+-- ---------------------------------------------------------------------------
+
+--- Build deps where the full pipeline succeeds with no skill outputs.
+--- PENDING → PLANNING → EXECUTING → COMPLETE
+local function e2e_no_skill_deps()
+  return mocks.make_agent_deps({
+    -- planner succeeds (default)
+    -- cmd_plan succeeds (default), plan has no outputs → no skill scan
+    -- skill_loader returns no skills (default)
+  })
+end
+
+--- Build deps where execution produces one skill output.
+--- PENDING → PLANNING → EXECUTING → TESTING → APPROVAL
+local function e2e_skill_deps(skill_path)
+  skill_path = skill_path or "src/my_skill.lua"
+  return mocks.make_agent_deps({
+    plan_overrides         = { outputs = { skill_path } },
+    skill_loader_overrides = { skill_paths = { skill_path } },
+    -- skill_runner passes by default
+  })
+end
+
+--- Build deps where cmd_plan fails once then succeeds.
+--- PENDING → PLANNING → EXECUTING → REPLANNING → PLANNING → EXECUTING → COMPLETE
+local function e2e_fail_then_succeed_deps()
+  local call_count = 0
+  local cmd_plan = {
+    run = function(args, _deps)
+      call_count = call_count + 1
+      if call_count == 1 then
+        return nil, "transient error"
+      end
+      return true, nil
+    end,
+    _call_count = function() return call_count end,
+  }
+  return mocks.make_agent_deps({ cmd_plan = cmd_plan })
+end
+
+-- ---------------------------------------------------------------------------
+-- Happy path: no skills → COMPLETE
+-- ---------------------------------------------------------------------------
+
+describe("agent.run end-to-end: no skills (PENDING → COMPLETE)", function()
+
+  it("returns a task in COMPLETE status", function()
+    local deps = e2e_no_skill_deps()
+    local t    = agent.run(deps, "generate a readme")
+    assert.equals(task.COMPLETE, t.status)
+  end)
+
+  it("task history includes planning, executing, and complete entries", function()
+    local deps = e2e_no_skill_deps()
+    local t    = agent.run(deps, "generate a readme")
+    local statuses = {}
+    for _, h in ipairs(t.history) do statuses[#statuses + 1] = h.status end
+    assert.is_truthy(table.concat(statuses, ","):find("planning", 1, true))
+    assert.is_truthy(table.concat(statuses, ","):find("executing", 1, true))
+    assert.is_truthy(table.concat(statuses, ","):find("complete", 1, true))
+  end)
+
+  it("calls state.save at least once", function()
+    local deps = e2e_no_skill_deps()
+    agent.run(deps, "generate a readme")
+    assert.is_true(#deps.state._saved >= 1)
+  end)
+
+  it("state.save is called after every step (saved count >= step count)", function()
+    local deps = e2e_no_skill_deps()
+    local t    = agent.run(deps, "generate a readme")
+    -- Steps: PENDING, PLANNING, EXECUTING — at minimum 3 saves.
+    assert.is_true(#deps.state._saved >= 3)
+  end)
+
+  it("final saved task has COMPLETE status", function()
+    local deps = e2e_no_skill_deps()
+    local t    = agent.run(deps, "generate a readme")
+    local last_saved = deps.state._saved[#deps.state._saved]
+    assert.equals(task.COMPLETE, last_saved.status)
+  end)
+
+end)
+
+-- ---------------------------------------------------------------------------
+-- Happy path with skills → APPROVAL (paused)
+-- ---------------------------------------------------------------------------
+
+describe("agent.run end-to-end: skill output (PENDING → APPROVAL, paused)", function()
+
+  it("returns a task in APPROVAL status", function()
+    local deps = e2e_skill_deps("src/my_skill.lua")
+    local t    = agent.run(deps, "create a skill")
+    assert.equals(task.APPROVAL, t.status)
+  end)
+
+  it("task history passes through testing", function()
+    local deps = e2e_skill_deps("src/my_skill.lua")
+    local t    = agent.run(deps, "create a skill")
+    local statuses = {}
+    for _, h in ipairs(t.history) do statuses[#statuses + 1] = h.status end
+    assert.is_truthy(table.concat(statuses, ","):find("testing", 1, true))
+  end)
+
+  it("t.skill_files is populated", function()
+    local deps = e2e_skill_deps("src/my_skill.lua")
+    local t    = agent.run(deps, "create a skill")
+    assert.equals(1, #t.skill_files)
+    assert.equals("src/my_skill.lua", t.skill_files[1])
+  end)
+
+  it("t.approval_id is set", function()
+    local deps = e2e_skill_deps("src/my_skill.lua")
+    local t    = agent.run(deps, "create a skill")
+    assert.is_string(t.approval_id)
+  end)
+
+  it("state.save called after reaching APPROVAL", function()
+    local deps = e2e_skill_deps("src/my_skill.lua")
+    local t    = agent.run(deps, "create a skill")
+    -- The last save should have the paused APPROVAL task.
+    local last_saved = deps.state._saved[#deps.state._saved]
+    assert.equals(task.APPROVAL, last_saved.status)
+  end)
+
+end)
+
+-- ---------------------------------------------------------------------------
+-- Failure + replan: EXECUTING fails once, replan succeeds → COMPLETE
+-- ---------------------------------------------------------------------------
+
+describe("agent.run end-to-end: execution failure + replan → COMPLETE", function()
+
+  it("returns COMPLETE after recovering from an execution failure", function()
+    local deps = e2e_fail_then_succeed_deps()
+    local t    = agent.run(deps, "do something")
+    assert.equals(task.COMPLETE, t.status)
+  end)
+
+  it("task history includes a replanning entry", function()
+    local deps = e2e_fail_then_succeed_deps()
+    local t    = agent.run(deps, "do something")
+    local statuses = {}
+    for _, h in ipairs(t.history) do statuses[#statuses + 1] = h.status end
+    assert.is_truthy(table.concat(statuses, ","):find("replanning", 1, true))
+  end)
+
+  it("planner.replan was called once", function()
+    local deps = e2e_fail_then_succeed_deps()
+    agent.run(deps, "do something")
+    assert.equals(1, #deps.planner._replan_calls)
+  end)
+
+  it("state.save called throughout (saves > 3)", function()
+    local deps = e2e_fail_then_succeed_deps()
+    agent.run(deps, "do something")
+    -- Sequence is at least: PENDING, PLANNING, EXECUTING, REPLANNING, PLANNING, EXECUTING, COMPLETE
+    assert.is_true(#deps.state._saved >= 5)
+  end)
+
+end)
+
+-- ---------------------------------------------------------------------------
+-- Max steps exceeded → FAILED
+-- ---------------------------------------------------------------------------
+
+describe("agent.run end-to-end: max_steps exceeded → FAILED", function()
+
+  it("returns a task in FAILED status when max_steps is hit", function()
+    -- Use a planner that always succeeds but cmd_plan that always fails,
+    -- so the loop cycles without terminating.
+    local deps = mocks.make_agent_deps({
+      cmd_plan_overrides = { run_err = "always fails" },
+    })
+    local t = agent.run(deps, "do something", { max_steps = 4 })
+    assert.equals(task.FAILED, t.status)
+  end)
+
+  it("t.error mentions max steps", function()
+    local deps = mocks.make_agent_deps({
+      cmd_plan_overrides = { run_err = "always fails" },
+    })
+    local t = agent.run(deps, "do something", { max_steps = 4 })
+    assert.is_truthy(t.error:find("max steps", 1, true))
+  end)
+
+  it("state.save called after max-steps FAILED transition", function()
+    local deps = mocks.make_agent_deps({
+      cmd_plan_overrides = { run_err = "always fails" },
+    })
+    agent.run(deps, "do something", { max_steps = 4 })
+    local last_saved = deps.state._saved[#deps.state._saved]
+    assert.equals(task.FAILED, last_saved.status)
+  end)
+
+end)
+
+-- ---------------------------------------------------------------------------
+-- state.save called after every step
+-- ---------------------------------------------------------------------------
+
+describe("agent.run state.save discipline", function()
+
+  it("saves after each individual step, not just at terminal state", function()
+    -- Intercept saves and record the status at each save point.
+    local saved_statuses = {}
+    local deps = e2e_no_skill_deps()
+    deps.state = {
+      save   = function(t) saved_statuses[#saved_statuses + 1] = t.status end,
+      _saved = saved_statuses,
+    }
+    agent.run(deps, "do something")
+    -- We should see intermediate statuses, not just the final one.
+    -- At minimum: planning, executing, complete are all present.
+    local seen = {}
+    for _, s in ipairs(saved_statuses) do seen[s] = true end
+    assert.is_true(seen[task.PLANNING]  ~= nil, "planning step should be saved")
+    assert.is_true(seen[task.EXECUTING] ~= nil, "executing step should be saved")
+    assert.is_true(seen[task.COMPLETE]  ~= nil, "complete step should be saved")
   end)
 
 end)
