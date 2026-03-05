@@ -304,20 +304,28 @@ end)
 
 describe("agent.resume", function()
 
-  it("returns nil + error when task_obj is nil", function()
+  it("returns nil + error when task_obj is nil and state has no saved task", function()
     local deps = ok_deps()
-    local t, err = agent.resume(deps, nil)
-    assert.is_nil(t)
+    -- ok_deps has no state.load, so passing nil task_obj → "no saved task" error.
+    local result, err = agent.resume(deps, nil)
+    assert.is_nil(result)
     assert.is_string(err)
+    assert.is_truthy(err:find("no saved task", 1, true))
   end)
 
-  it("returns nil + error when task is not in APPROVAL status", function()
+  it("returns the task (not nil) when status is not APPROVAL", function()
+    -- New behaviour: non-APPROVAL is not an error; task is returned with a message.
+    local deps   = ok_deps()
+    local t      = mocks.make_task_obj()   -- PENDING status
+    local result = agent.resume(deps, t)
+    assert.equals(t, result)
+  end)
+
+  it("does not change status when task is not in APPROVAL", function()
     local deps = ok_deps()
     local t    = mocks.make_task_obj()   -- PENDING status
-    local result, err = agent.resume(deps, t)
-    assert.is_nil(result)
-    assert.is_truthy(err:find("not paused", 1, true) or err:find("APPROVAL", 1, true)
-                     or err:find("approval", 1, true))
+    agent.resume(deps, t)
+    assert.equals(task.PENDING, t.status)
   end)
 
 end)
@@ -1207,6 +1215,307 @@ describe("agent.step on PLANNING task (plan_path pre-set by replan)", function()
     t.plan_path = "./already_replanned.md"
     agent.step(deps, t)
     assert.equals(0, t.attempts.plan)
+  end)
+
+end)
+
+-- ===========================================================================
+-- Step 3f — agent.resume (promotion flow) tests
+-- ===========================================================================
+
+-- ---------------------------------------------------------------------------
+-- Helpers specific to 3f
+-- ---------------------------------------------------------------------------
+
+--- Build a task in APPROVAL status with skill_files and approval_id set.
+local function approval_task_for_resume(skill_files, overrides)
+  overrides = overrides or {}
+  local t = mocks.make_task_obj({ prompt = overrides.prompt or "do something" })
+  task.transition(t, task.PLANNING)
+  task.transition(t, task.EXECUTING)
+  task.transition(t, task.TESTING)
+  task.transition(t, task.APPROVAL)
+  t.skill_files  = skill_files or {}
+  t.approval_id  = overrides.approval_id or "test-approval-id"
+  t.test_results = overrides.test_results or {}
+  return t
+end
+
+--- Build deps suitable for resume tests.
+local function resume_deps(overrides)
+  return mocks.make_agent_deps(overrides or {})
+end
+
+-- ---------------------------------------------------------------------------
+-- agent.resume — no saved task
+-- ---------------------------------------------------------------------------
+
+describe("agent.resume with no saved task", function()
+
+  it("returns nil + error when state.load returns nil", function()
+    local deps  = resume_deps({ state_overrides = { load_err = "file not found" } })
+    local result, err = agent.resume(deps)  -- no task_obj → load from state
+    assert.is_nil(result)
+    assert.is_truthy(err:find("no saved task", 1, true))
+  end)
+
+  it("error message includes the underlying load error", function()
+    local deps  = resume_deps({ state_overrides = { load_err = "corrupt state file" } })
+    local _, err = agent.resume(deps)
+    assert.is_truthy(err:find("corrupt state file", 1, true))
+  end)
+
+  it("returns nil + error when state dep is absent entirely", function()
+    local deps = resume_deps()
+    deps.state = nil
+    local result, err = agent.resume(deps)
+    assert.is_nil(result)
+    assert.is_truthy(err:find("no saved task", 1, true))
+  end)
+
+end)
+
+-- ---------------------------------------------------------------------------
+-- agent.resume — all skills already promoted → COMPLETE
+-- ---------------------------------------------------------------------------
+
+describe("agent.resume when all skills are already promoted", function()
+
+  it("transitions the task to COMPLETE", function()
+    local t = approval_task_for_resume({ "src/my_skill.lua" })
+    local deps = resume_deps({
+      approval_overrides = { promoted_skills = { "my_skill" } },
+      state_overrides    = { task_to_load = t },
+    })
+    agent.resume(deps)
+    assert.equals(task.COMPLETE, t.status)
+  end)
+
+  it("calls check_promotion for each skill", function()
+    local t = approval_task_for_resume({ "src/skill_a.lua", "src/skill_b.lua" })
+    local deps = resume_deps({
+      approval_overrides = { promoted_skills = { "skill_a", "skill_b" } },
+      state_overrides    = { task_to_load = t },
+    })
+    agent.resume(deps)
+    assert.is_true(#deps.approval._check_calls >= 2)
+  end)
+
+  it("calls check_promotion with the derived skill name and allowed_dir", function()
+    local t = approval_task_for_resume({ "src/my_skill.lua" })
+    local deps = resume_deps({
+      approval_overrides = { promoted_skills = { "my_skill" } },
+      config_overrides   = { store = { ["skills.allowed_dir"] = "/opt/skills" } },
+      state_overrides    = { task_to_load = t },
+    })
+    agent.resume(deps)
+    local call = deps.approval._check_calls[1]
+    assert.equals("my_skill",   call.skill_name)
+    assert.equals("/opt/skills", call.allowed_dir)
+  end)
+
+  it("saves state after transitioning to COMPLETE", function()
+    local t = approval_task_for_resume({ "src/my_skill.lua" })
+    local deps = resume_deps({
+      approval_overrides = { promoted_skills = { "my_skill" } },
+      state_overrides    = { task_to_load = t },
+    })
+    agent.resume(deps)
+    assert.equals(1, #deps.state._saved)
+  end)
+
+  it("works when task_obj is passed directly (bypasses state.load)", function()
+    local t = approval_task_for_resume({ "src/my_skill.lua" })
+    local deps = resume_deps({
+      approval_overrides = { promoted_skills = { "my_skill" } },
+    })
+    agent.resume(deps, t)   -- task_obj supplied directly
+    assert.equals(task.COMPLETE, t.status)
+  end)
+
+  it("loads task from state.load when no task_obj is given", function()
+    local t = approval_task_for_resume({ "src/my_skill.lua" })
+    local deps = resume_deps({
+      approval_overrides = { promoted_skills = { "my_skill" } },
+      state_overrides    = { task_to_load = t },
+    })
+    local returned = agent.resume(deps)   -- no task_obj arg
+    assert.equals(task.COMPLETE, returned.status)
+  end)
+
+end)
+
+-- ---------------------------------------------------------------------------
+-- agent.resume — skills not promoted → prompt_human called
+-- ---------------------------------------------------------------------------
+
+describe("agent.resume when skills are not yet promoted", function()
+
+  it("calls prompt_human for each un-promoted skill", function()
+    local t = approval_task_for_resume({ "src/my_skill.lua" })
+    local deps = resume_deps({
+      approval_overrides = {
+        promoted_skills = {},     -- nothing promoted
+        prompt_response = "reject",
+      },
+      state_overrides = { task_to_load = t },
+    })
+    agent.resume(deps, t)
+    assert.equals(1, #deps.approval._prompt_calls)
+  end)
+
+  it("does not call prompt_human for already-promoted skills", function()
+    local t = approval_task_for_resume({ "src/skill_a.lua", "src/skill_b.lua" })
+    local deps = resume_deps({
+      approval_overrides = {
+        promoted_skills = { "skill_a" },  -- only a is promoted
+        prompt_response = "reject",
+      },
+    })
+    agent.resume(deps, t)
+    -- Only skill_b needs prompting
+    assert.equals(1, #deps.approval._prompt_calls)
+  end)
+
+  it("fetches the approval record via approval.get before prompt_human", function()
+    local t = approval_task_for_resume({ "src/my_skill.lua" },
+      { approval_id = "abc-123" })
+    local deps = resume_deps({
+      approval_overrides = {
+        promoted_skills = {},
+        prompt_response = "reject",
+      },
+    })
+    agent.resume(deps, t)
+    assert.equals(1, #deps.approval._get_calls)
+    assert.equals("abc-123", deps.approval._get_calls[1].approval_id)
+  end)
+
+end)
+
+-- ---------------------------------------------------------------------------
+-- agent.resume — human says approve (Y)
+-- ---------------------------------------------------------------------------
+
+describe("agent.resume when human approves (prints commands, stays APPROVAL)", function()
+
+  it("task remains in APPROVAL after human approves (must re-run resume)", function()
+    local t = approval_task_for_resume({ "src/my_skill.lua" })
+    local deps = resume_deps({
+      approval_overrides = {
+        promoted_skills = {},
+        prompt_response = "approve",
+        promotion_cmds  = { "cp my_skill.lua /skills/" },
+      },
+    })
+    agent.resume(deps, t)
+    assert.equals(task.APPROVAL, t.status)
+  end)
+
+  it("prints promotion commands after human approves", function()
+    local printed = {}
+    local t = approval_task_for_resume({ "src/my_skill.lua" })
+    local deps = resume_deps({
+      approval_overrides = {
+        promoted_skills = {},
+        prompt_response = "approve",
+        promotion_cmds  = { "cp my_skill.lua /skills/" },
+      },
+    })
+    deps.print = function(s) printed[#printed + 1] = s end
+    agent.resume(deps, t)
+    local found = false
+    for _, line in ipairs(printed) do
+      if line:find("cp my_skill.lua /skills/", 1, true) then found = true; break end
+    end
+    assert.is_true(found, "promotion command should be printed after approve")
+  end)
+
+  it("prints instructions to re-run resume", function()
+    local printed = {}
+    local t = approval_task_for_resume({ "src/my_skill.lua" })
+    local deps = resume_deps({
+      approval_overrides = { promoted_skills = {}, prompt_response = "approve" },
+    })
+    deps.print = function(s) printed[#printed + 1] = s end
+    agent.resume(deps, t)
+    local found = false
+    for _, line in ipairs(printed) do
+      if line:find("resume", 1, true) then found = true; break end
+    end
+    assert.is_true(found, "should instruct human to re-run resume")
+  end)
+
+end)
+
+-- ---------------------------------------------------------------------------
+-- agent.resume — human rejects (N) → FAILED
+-- ---------------------------------------------------------------------------
+
+describe("agent.resume when human rejects", function()
+
+  it("transitions to FAILED when human rejects", function()
+    local t = approval_task_for_resume({ "src/my_skill.lua" })
+    local deps = resume_deps({
+      approval_overrides = { promoted_skills = {}, prompt_response = "reject" },
+    })
+    agent.resume(deps, t)
+    assert.equals(task.FAILED, t.status)
+  end)
+
+  it("failure detail mentions the rejected skill name", function()
+    local t = approval_task_for_resume({ "src/my_skill.lua" })
+    local deps = resume_deps({
+      approval_overrides = { promoted_skills = {}, prompt_response = "reject" },
+    })
+    agent.resume(deps, t)
+    local detail = t.history[#t.history].detail
+    assert.is_truthy(detail:find("my_skill", 1, true))
+  end)
+
+  it("saves state after transitioning to FAILED", function()
+    local t = approval_task_for_resume({ "src/my_skill.lua" })
+    local deps = resume_deps({
+      approval_overrides = { promoted_skills = {}, prompt_response = "reject" },
+    })
+    agent.resume(deps, t)
+    assert.equals(1, #deps.state._saved)
+  end)
+
+end)
+
+-- ---------------------------------------------------------------------------
+-- agent.resume — task not in APPROVAL status
+-- ---------------------------------------------------------------------------
+
+describe("agent.resume when task is not in APPROVAL status", function()
+
+  it("returns the task without error when status is not APPROVAL", function()
+    local t = mocks.make_task_obj()    -- PENDING
+    local deps = resume_deps()
+    local returned = agent.resume(deps, t)
+    assert.equals(t, returned)
+  end)
+
+  it("does not transition the task when status is not APPROVAL", function()
+    local t = mocks.make_task_obj()    -- PENDING
+    local deps = resume_deps()
+    agent.resume(deps, t)
+    assert.equals(task.PENDING, t.status)
+  end)
+
+  it("prints an informational message about the current status", function()
+    local printed = {}
+    local t = mocks.make_task_obj()
+    local deps = resume_deps()
+    deps.print = function(s) printed[#printed + 1] = s end
+    agent.resume(deps, t)
+    assert.is_true(#printed >= 1, "should print something")
+    local found = false
+    for _, line in ipairs(printed) do
+      if line:find(task.PENDING, 1, true) then found = true; break end
+    end
+    assert.is_true(found, "should mention current status in output")
   end)
 
 end)

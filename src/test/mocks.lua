@@ -415,21 +415,41 @@ end
 ---   approval_id     — id placed in every returned record (default: "test-approval-id")
 ---   promotion_cmds  — list returned by get_promotion_commands (default: {"# cmd1"})
 ---   promotion_err   — error string; causes get_promotion_commands() to return nil + err
---- Tracks calls in ._create_calls and ._promo_calls.
+--- Tracks calls in ._create_calls, ._promo_calls, ._get_calls, ._prompt_calls,
+--- and ._check_calls.
+---
+--- Supported overrides:
+---   approval_id       — id in every create record (default: "test-approval-id")
+---   create_err        — error string for create()
+---   promotion_cmds    — list returned by get_promotion_commands
+---   promotion_err     — error string for get_promotion_commands
+---   promoted_skills   — set of skill_names that check_promotion returns true for
+---   get_record        — table returned by get() (default: minimal record)
+---   get_err           — error string for get()
+---   prompt_response   — string returned by prompt_human (default: "reject")
 function M.make_approval(overrides)
   overrides = overrides or {}
-  local create_calls = {}
-  local promo_calls  = {}
-  local approval_id  = overrides.approval_id or "test-approval-id"
+  local create_calls  = {}
+  local promo_calls   = {}
+  local get_calls     = {}
+  local prompt_calls  = {}
+  local check_calls   = {}
+  local approval_id   = overrides.approval_id or "test-approval-id"
+
+  -- Build promoted set from list.
+  local promoted_set = {}
+  for _, name in ipairs(overrides.promoted_skills or {}) do
+    promoted_set[name] = true
+  end
 
   return {
     create = function(skill_name, skill_path, test_path, test_results, metadata, approvals_dir)
       create_calls[#create_calls + 1] = {
-        skill_name   = skill_name,
-        skill_path   = skill_path,
-        test_path    = test_path,
-        test_results = test_results,
-        metadata     = metadata,
+        skill_name    = skill_name,
+        skill_path    = skill_path,
+        test_path     = test_path,
+        test_results  = test_results,
+        metadata      = metadata,
         approvals_dir = approvals_dir,
       }
       if overrides.create_err then return nil, overrides.create_err end
@@ -441,6 +461,27 @@ function M.make_approval(overrides)
       }, nil
     end,
 
+    get = function(_approvals_dir, _approval_id)
+      get_calls[#get_calls + 1] = { approvals_dir = _approvals_dir, approval_id = _approval_id }
+      if overrides.get_err then return nil, overrides.get_err end
+      return overrides.get_record or {
+        id         = _approval_id or approval_id,
+        skill_name = "stub_skill",
+        skill_path = "src/stub_skill.lua",
+        test_path  = "src/stub_skill.test.lua",
+      }, nil
+    end,
+
+    check_promotion = function(skill_name, _allowed_dir)
+      check_calls[#check_calls + 1] = { skill_name = skill_name, allowed_dir = _allowed_dir }
+      return promoted_set[skill_name] == true
+    end,
+
+    prompt_human = function(record)
+      prompt_calls[#prompt_calls + 1] = record
+      return overrides.prompt_response or "reject"
+    end,
+
     get_promotion_commands = function(record, allowed_dir)
       promo_calls[#promo_calls + 1] = { record = record, allowed_dir = allowed_dir }
       if overrides.promotion_err then return nil, overrides.promotion_err end
@@ -449,6 +490,9 @@ function M.make_approval(overrides)
 
     _create_calls = create_calls,
     _promo_calls  = promo_calls,
+    _get_calls    = get_calls,
+    _prompt_calls = prompt_calls,
+    _check_calls  = check_calls,
   }
 end
 
@@ -460,15 +504,25 @@ end
 --- Tracks save() calls in ._saved.
 --- Supported overrides:
 ---   save_err — error string; causes save() to return nil + err
+--- Supported overrides:
+---   task_to_load — task table returned by load() (default: nil → triggers load_err)
+---   load_err     — error string returned when task_to_load is nil (default: "no saved task")
+---   save_err     — error string for save()
 function M.make_state(overrides)
   overrides = overrides or {}
   local saved = {}
   return {
+    load = function()
+      if overrides.task_to_load then return overrides.task_to_load, nil end
+      return nil, overrides.load_err or "no saved task"
+    end,
+
     save = function(task_obj)
       saved[#saved + 1] = task_obj
       if overrides.save_err then return nil, overrides.save_err end
       return true, nil
     end,
+
     _saved = saved,
   }
 end

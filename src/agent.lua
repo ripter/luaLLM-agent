@@ -9,6 +9,7 @@
 --- Step 3c: handle_testing.
 --- Step 3d: handle_approval.
 --- Step 3e: handle_replanning.
+--- Step 3f: agent.resume (promotion flow).
 
 local _src = debug.getinfo(1, "S").source:match("^@(.*/)") or "./"
 package.path = _src .. "?.lua;" .. package.path
@@ -483,17 +484,39 @@ end
 -- Public API: resume
 -- ---------------------------------------------------------------------------
 
---- Resume a paused (APPROVAL) task.
---- Placeholder — full implementation in Step 3c when approval handler is added.
+--- Resume a paused task from saved state.
 ---
---- @param deps  table
---- @param task_obj table  A task table in APPROVAL status.
---- @param opts  table     Optional.
+--- Flow:
+---   1. Load the task from deps.state.load() (or accept task_obj directly for tests).
+---   2. If status is APPROVAL: run the promotion-check / human-prompt loop.
+---   3. All skills promoted → COMPLETE.  Human rejects → FAILED.
+---
+--- @param deps     table   Dependency table.
+--- @param task_obj table   Optional: pre-loaded task (used by tests / internal callers).
+---                          When nil, task is loaded from deps.state.load().
+--- @param opts     table   Optional.
 ---
 --- @return table|nil, string
 function M.resume(deps, task_obj, opts)
   if type(deps) ~= "table" then
     deps = default_deps()
+  end
+  opts = opts or {}
+
+  local emit        = deps.print or function(_) end
+  local allowed_dir = deps.config.get("skills.allowed_dir") or "./skills"
+  local approvals_dir = deps.config.get("approvals.dir") or nil  -- nil → approval default
+
+  -- Load task from state if not supplied directly.
+  if task_obj == nil then
+    if not deps.state or type(deps.state.load) ~= "function" then
+      return nil, "agent.resume: no saved task (state.load unavailable)"
+    end
+    local loaded, load_err = deps.state.load()
+    if not loaded then
+      return nil, "agent.resume: no saved task: " .. tostring(load_err)
+    end
+    task_obj = loaded
   end
 
   if type(task_obj) ~= "table" then
@@ -501,27 +524,112 @@ function M.resume(deps, task_obj, opts)
   end
 
   if task_obj.status ~= deps.task.APPROVAL then
-    return nil, "agent.resume: task is not paused (status: " .. tostring(task_obj.status) .. ")"
+    emit("  Task status is '" .. tostring(task_obj.status)
+         .. "' — nothing to resume (not waiting for approval).")
+    return task_obj
   end
 
-  -- Drive the loop from the current (APPROVAL) state.
-  opts = opts or {}
-  local max_steps = opts.max_steps or 20
-  local steps     = 0
+  -- Build a list of (skill_path, skill_name, approval_id) triples from skill_files.
+  -- We pair each skill_file with the stored approval_id; for multi-skill tasks the
+  -- IDs are stored in t.approval_ids (set by handle_approval) or we fall back to
+  -- t.approval_id for the single-skill common case.
+  local skill_entries = {}
+  local approval_ids  = task_obj.approval_ids
+                     or (task_obj.approval_id and { task_obj.approval_id })
+                     or {}
 
-  while not deps.task.is_terminal(task_obj) and not deps.task.is_paused(task_obj) do
-    steps = steps + 1
-    if steps > max_steps then
+  for i, skill_path in ipairs(task_obj.skill_files or {}) do
+    skill_entries[#skill_entries + 1] = {
+      skill_path  = skill_path,
+      skill_name  = skill_name_for(skill_path),
+      approval_id = approval_ids[i],
+    }
+  end
+
+  if #skill_entries == 0 then
+    -- No skills to check; transition directly to COMPLETE.
+    deps.task.transition(task_obj, deps.task.COMPLETE, "resume: no skills to promote")
+    if deps.state and type(deps.state.save) == "function" then
+      deps.state.save(task_obj)
+    end
+    return task_obj
+  end
+
+  -- Check promotion status for each skill.
+  local function all_promoted()
+    for _, entry in ipairs(skill_entries) do
+      if not deps.approval.check_promotion(entry.skill_name, allowed_dir) then
+        return false
+      end
+    end
+    return true
+  end
+
+  if all_promoted() then
+    deps.task.transition(task_obj, deps.task.COMPLETE, "all skills promoted")
+    if deps.state and type(deps.state.save) == "function" then
+      deps.state.save(task_obj)
+    end
+    emit("  All skills promoted. Task complete.")
+    return task_obj
+  end
+
+  -- At least one skill is not yet promoted — prompt the human.
+  for _, entry in ipairs(skill_entries) do
+    if deps.approval.check_promotion(entry.skill_name, allowed_dir) then
+      goto continue
+    end
+
+    -- Fetch the full approval record (needed by prompt_human).
+    local record = nil
+    if entry.approval_id then
+      local r, get_err = deps.approval.get(approvals_dir, entry.approval_id)
+      if r then
+        record = r
+      else
+        emit("  Warning: could not load approval record for '"
+             .. entry.skill_name .. "': " .. tostring(get_err))
+      end
+    end
+
+    -- Fall back to a minimal record if get failed or no ID stored.
+    if not record then
+      record = {
+        skill_name = entry.skill_name,
+        skill_path = entry.skill_path,
+        test_path  = test_path_for(entry.skill_path),
+      }
+    end
+
+    local choice = deps.approval.prompt_human(record)
+
+    if choice == "approve" or choice == "y" then
+      -- Print promotion commands so the human can run them.
+      local cmds, cmds_err = deps.approval.get_promotion_commands(record, allowed_dir)
+      if cmds then
+        emit("")
+        emit("  Run these commands to promote '" .. entry.skill_name .. "':")
+        for _, cmd in ipairs(cmds) do emit("    " .. cmd) end
+        emit("")
+        emit("  Then run:  ./agent resume")
+      else
+        emit("  (could not generate promotion commands: " .. tostring(cmds_err) .. ")")
+      end
+      -- Return the task still in APPROVAL — the human must re-run resume.
+      return task_obj
+
+    elseif choice == "reject" or choice == "n" then
       deps.task.transition(task_obj, deps.task.FAILED,
-        "agent.resume: exceeded max_steps (" .. max_steps .. ")")
-      break
+        "human rejected skill '" .. entry.skill_name .. "'")
+      if deps.state and type(deps.state.save) == "function" then
+        deps.state.save(task_obj)
+      end
+      return task_obj
     end
+    -- Other choices (view, rerun, edit, print_promote, mark_promoted) fall
+    -- through — the human must re-run resume to re-enter the loop.
 
-    local result, err = M.step(deps, task_obj)
-    if not result then
-      deps.task.transition(task_obj, deps.task.FAILED, tostring(err))
-      break
-    end
+    ::continue::
   end
 
   return task_obj
