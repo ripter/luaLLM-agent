@@ -406,6 +406,74 @@ function M.make_skill_runner(overrides)
 end
 
 -- ---------------------------------------------------------------------------
+-- approval mock factory
+-- ---------------------------------------------------------------------------
+
+--- Build a stub approval module for agent tests.
+--- Supported overrides:
+---   create_err      — error string; causes create() to return nil + err
+---   approval_id     — id placed in every returned record (default: "test-approval-id")
+---   promotion_cmds  — list returned by get_promotion_commands (default: {"# cmd1"})
+---   promotion_err   — error string; causes get_promotion_commands() to return nil + err
+--- Tracks calls in ._create_calls and ._promo_calls.
+function M.make_approval(overrides)
+  overrides = overrides or {}
+  local create_calls = {}
+  local promo_calls  = {}
+  local approval_id  = overrides.approval_id or "test-approval-id"
+
+  return {
+    create = function(skill_name, skill_path, test_path, test_results, metadata, approvals_dir)
+      create_calls[#create_calls + 1] = {
+        skill_name   = skill_name,
+        skill_path   = skill_path,
+        test_path    = test_path,
+        test_results = test_results,
+        metadata     = metadata,
+        approvals_dir = approvals_dir,
+      }
+      if overrides.create_err then return nil, overrides.create_err end
+      return {
+        id         = approval_id,
+        skill_name = skill_name,
+        skill_path = skill_path or "",
+        test_path  = test_path  or "",
+      }, nil
+    end,
+
+    get_promotion_commands = function(record, allowed_dir)
+      promo_calls[#promo_calls + 1] = { record = record, allowed_dir = allowed_dir }
+      if overrides.promotion_err then return nil, overrides.promotion_err end
+      return overrides.promotion_cmds or { "# promote " .. (record.skill_name or "?") }, nil
+    end,
+
+    _create_calls = create_calls,
+    _promo_calls  = promo_calls,
+  }
+end
+
+-- ---------------------------------------------------------------------------
+-- state mock factory
+-- ---------------------------------------------------------------------------
+
+--- Build a stub state module for agent tests.
+--- Tracks save() calls in ._saved.
+--- Supported overrides:
+---   save_err — error string; causes save() to return nil + err
+function M.make_state(overrides)
+  overrides = overrides or {}
+  local saved = {}
+  return {
+    save = function(task_obj)
+      saved[#saved + 1] = task_obj
+      if overrides.save_err then return nil, overrides.save_err end
+      return true, nil
+    end,
+    _saved = saved,
+  }
+end
+
+-- ---------------------------------------------------------------------------
 -- Planner-specific mock factory
 -- ---------------------------------------------------------------------------
 
@@ -471,6 +539,8 @@ end
 ---   cmd_plan_overrides      — forwarded to make_cmd_plan
 ---   skill_loader_overrides  — forwarded to make_skill_loader
 ---   skill_runner_overrides  — forwarded to make_skill_runner
+---   approval_overrides     — forwarded to make_approval
+---   state_overrides        — forwarded to make_state
 ---   config_overrides / luallm_overrides / safe_fs_overrides — pass-through
 function M.make_agent_deps(overrides)
   overrides = overrides or {}
@@ -491,7 +561,8 @@ function M.make_agent_deps(overrides)
     cmd_plan     = overrides.cmd_plan     or M.make_cmd_plan(overrides.cmd_plan_overrides or {}),
     skill_loader = overrides.skill_loader or M.make_skill_loader(overrides.skill_loader_overrides or {}),
     skill_runner = overrides.skill_runner or M.make_skill_runner(overrides.skill_runner_overrides or {}),
-    approval     = overrides.approval,
+    state        = overrides.state        or M.make_state(overrides.state_overrides or {}),
+    approval     = overrides.approval     or M.make_approval(overrides.approval_overrides or {}),
     config       = base_deps.config,
     luallm       = base_deps.luallm,
     safe_fs      = base_deps.safe_fs,

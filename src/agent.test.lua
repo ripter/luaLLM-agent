@@ -776,3 +776,218 @@ describe("agent.step on TESTING task (multiple skills, mixed pass/fail)", functi
   end)
 
 end)
+
+-- ===========================================================================
+-- Step 3d — handle_approval tests
+-- ===========================================================================
+
+-- ---------------------------------------------------------------------------
+-- Helpers specific to 3d
+-- ---------------------------------------------------------------------------
+
+--- Build a task already at APPROVAL status with skill_files and test_results set.
+local function approval_task(skill_files, overrides)
+  overrides   = overrides or {}
+  local t = mocks.make_task_obj({ prompt = overrides.prompt or "do something" })
+  task.transition(t, task.PLANNING)
+  task.transition(t, task.EXECUTING)
+  task.transition(t, task.TESTING)
+  task.transition(t, task.APPROVAL)
+  t.skill_files  = skill_files or {}
+  t.test_results = overrides.test_results or {}
+  return t
+end
+
+--- Shorthand: deps for approval tests with sensible defaults.
+local function approval_deps(overrides)
+  return mocks.make_agent_deps(overrides or {})
+end
+
+-- ---------------------------------------------------------------------------
+-- handle_approval — approval.create called correctly
+-- ---------------------------------------------------------------------------
+
+describe("agent.step on APPROVAL task (approval.create)", function()
+
+  it("calls approval.create once per skill file", function()
+    local deps = approval_deps()
+    local t    = approval_task({ "src/skill_a.lua", "src/skill_b.lua" })
+    agent.step(deps, t)
+    assert.equals(2, #deps.approval._create_calls)
+  end)
+
+  it("passes the skill name (basename without .lua) to approval.create", function()
+    local deps = approval_deps()
+    local t    = approval_task({ "src/my_skill.lua" })
+    agent.step(deps, t)
+    assert.equals("my_skill", deps.approval._create_calls[1].skill_name)
+  end)
+
+  it("passes the skill_path to approval.create", function()
+    local deps = approval_deps()
+    local t    = approval_task({ "src/my_skill.lua" })
+    agent.step(deps, t)
+    assert.equals("src/my_skill.lua", deps.approval._create_calls[1].skill_path)
+  end)
+
+  it("passes the .test.lua path to approval.create", function()
+    local deps = approval_deps()
+    local t    = approval_task({ "src/my_skill.lua" })
+    agent.step(deps, t)
+    assert.equals("src/my_skill.test.lua", deps.approval._create_calls[1].test_path)
+  end)
+
+  it("passes matching test_results to approval.create", function()
+    local test_results = {
+      { skill_path = "src/my_skill.lua", test_path = "src/my_skill.test.lua",
+        passed = true, output = "ok" },
+    }
+    local deps = approval_deps()
+    local t    = approval_task({ "src/my_skill.lua" }, { test_results = test_results })
+    agent.step(deps, t)
+    local passed_results = deps.approval._create_calls[1].test_results
+    assert.equals(1, #passed_results)
+    assert.equals("src/my_skill.lua", passed_results[1].skill_path)
+  end)
+
+  it("passes metadata from skill_loader.parse_metadata to approval.create", function()
+    local deps = approval_deps({
+      skill_loader_overrides = { skill_paths = { "src/my_skill.lua" } },
+    })
+    local t = approval_task({ "src/my_skill.lua" })
+    agent.step(deps, t)
+    -- metadata should be a table (not nil)
+    assert.is_table(deps.approval._create_calls[1].metadata)
+  end)
+
+end)
+
+-- ---------------------------------------------------------------------------
+-- handle_approval — approval_id and task state
+-- ---------------------------------------------------------------------------
+
+describe("agent.step on APPROVAL task (task state)", function()
+
+  it("sets t.approval_id from the record returned by approval.create", function()
+    local deps = approval_deps({
+      approval_overrides = { approval_id = "my-approval-uuid" },
+    })
+    local t = approval_task({ "src/skill_a.lua" })
+    agent.step(deps, t)
+    assert.equals("my-approval-uuid", t.approval_id)
+  end)
+
+  it("t.approval_id is set to the first skill's record id with multiple skills", function()
+    local deps = approval_deps({
+      approval_overrides = { approval_id = "first-uuid" },
+    })
+    local t = approval_task({ "src/skill_a.lua", "src/skill_b.lua" })
+    agent.step(deps, t)
+    assert.equals("first-uuid", t.approval_id)
+  end)
+
+  it("task remains in APPROVAL status (it is a pause point)", function()
+    local deps = approval_deps()
+    local t    = approval_task({ "src/skill_a.lua" })
+    agent.step(deps, t)
+    assert.equals(task.APPROVAL, t.status)
+  end)
+
+  it("calls state.save with the task", function()
+    local deps = approval_deps()
+    local t    = approval_task({ "src/skill_a.lua" })
+    agent.step(deps, t)
+    assert.equals(1, #deps.state._saved)
+    assert.equals(t, deps.state._saved[1])
+  end)
+
+end)
+
+-- ---------------------------------------------------------------------------
+-- handle_approval — promotion commands are printed
+-- ---------------------------------------------------------------------------
+
+describe("agent.step on APPROVAL task (printed output)", function()
+
+  it("calls approval.get_promotion_commands once per skill", function()
+    local deps = approval_deps()
+    local t    = approval_task({ "src/skill_a.lua", "src/skill_b.lua" })
+    agent.step(deps, t)
+    assert.equals(2, #deps.approval._promo_calls)
+  end)
+
+  it("passes the record returned by create to get_promotion_commands", function()
+    local deps = approval_deps({
+      approval_overrides = { approval_id = "check-id" },
+    })
+    local t = approval_task({ "src/skill_a.lua" })
+    agent.step(deps, t)
+    local promo_record = deps.approval._promo_calls[1].record
+    assert.equals("check-id", promo_record.id)
+  end)
+
+  it("passes allowed_dir from config to get_promotion_commands", function()
+    local deps = approval_deps({
+      config_overrides = { store = { ["skills.allowed_dir"] = "/opt/skills" } },
+    })
+    local t = approval_task({ "src/skill_a.lua" })
+    agent.step(deps, t)
+    assert.equals("/opt/skills", deps.approval._promo_calls[1].allowed_dir)
+  end)
+
+  it("emits the promotion commands to deps.print", function()
+    local printed = {}
+    local deps    = approval_deps({
+      approval_overrides = { promotion_cmds = { "cp skill.lua /skills/" } },
+    })
+    deps.print = function(s) printed[#printed + 1] = s end
+    local t = approval_task({ "src/skill_a.lua" })
+    agent.step(deps, t)
+    local found = false
+    for _, line in ipairs(printed) do
+      if line:find("cp skill.lua /skills/", 1, true) then found = true; break end
+    end
+    assert.is_true(found, "promotion command should appear in printed output")
+  end)
+
+  it("emits resume instructions", function()
+    local printed = {}
+    local deps    = approval_deps()
+    deps.print = function(s) printed[#printed + 1] = s end
+    local t = approval_task({ "src/skill_a.lua" })
+    agent.step(deps, t)
+    local found = false
+    for _, line in ipairs(printed) do
+      if line:find("resume", 1, true) then found = true; break end
+    end
+    assert.is_true(found, "should print resume instructions")
+  end)
+
+end)
+
+-- ---------------------------------------------------------------------------
+-- handle_approval — approval.create failure → FAILED
+-- ---------------------------------------------------------------------------
+
+describe("agent.step on APPROVAL task (approval.create fails)", function()
+
+  it("transitions to FAILED when approval.create returns an error", function()
+    local deps = approval_deps({
+      approval_overrides = { create_err = "disk full" },
+    })
+    local t = approval_task({ "src/skill_a.lua" })
+    agent.step(deps, t)
+    assert.equals(task.FAILED, t.status)
+  end)
+
+  it("failure detail mentions the skill path", function()
+    local deps = approval_deps({
+      approval_overrides = { create_err = "disk full" },
+    })
+    local t = approval_task({ "src/skill_a.lua" })
+    agent.step(deps, t)
+    local detail = t.history[#t.history].detail
+    assert.is_truthy(detail:find("src/skill_a.lua", 1, true))
+  end)
+
+end)

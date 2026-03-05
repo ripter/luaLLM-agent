@@ -7,6 +7,7 @@
 --- Step 3a: handle_pending, handle_planning.
 --- Step 3b: handle_executing.
 --- Step 3c: handle_testing.
+--- Step 3d: handle_approval.
 
 local _src = debug.getinfo(1, "S").source:match("^@(.*/)") or "./"
 package.path = _src .. "?.lua;" .. package.path
@@ -26,6 +27,7 @@ local function default_deps()
     skill_loader = require("skill_loader"),
     skill_runner = require("skill_runner"),
     approval     = require("approval"),
+    state        = require("state"),
     config       = require("config"),
     luallm       = require("luallm"),
     safe_fs      = require("safe_fs"),
@@ -248,6 +250,96 @@ local function handle_testing(deps, t)
 end
 
 -- ---------------------------------------------------------------------------
+-- Handler: APPROVAL (paused — creates approval records, prints commands)
+-- ---------------------------------------------------------------------------
+
+--- Extract the skill name from a skill file path.
+--- Convention: "path/to/my_skill.lua" -> "my_skill"
+local function skill_name_for(skill_path)
+  local base = skill_path:match("([^/]+)$") or skill_path
+  return (base:gsub("%.lua$", ""))
+end
+
+--- Find the test_results entry for a given skill_path (nil if absent).
+local function results_for(test_results, skill_path)
+  if type(test_results) ~= "table" then return nil end
+  for _, r in ipairs(test_results) do
+    if r.skill_path == skill_path then return r end
+  end
+  return nil
+end
+
+local function handle_approval(deps, t)
+  local emit        = deps.print or function(_) end
+  local allowed_dir = deps.config.get("skills.allowed_dir") or "./skills"
+
+  -- Create an approval record for each skill file.
+  local approval_ids = {}
+
+  for _, skill_path in ipairs(t.skill_files or {}) do
+    local skill_name = skill_name_for(skill_path)
+    local test_path  = test_path_for(skill_path)
+
+    -- Gather test results for this skill (may be nil).
+    local skill_results = results_for(t.test_results, skill_path)
+    local test_results_arg = skill_results and { skill_results } or {}
+
+    -- Re-fetch metadata so the record has the full declared paths/deps.
+    local metadata = nil
+    if deps.skill_loader then
+      local meta, _ = deps.skill_loader.parse_metadata(skill_path)
+      metadata = meta
+    end
+
+    local record, err = deps.approval.create(
+      skill_name,
+      skill_path,
+      test_path,
+      test_results_arg,
+      metadata or {}
+    )
+
+    if not record then
+      -- Approval creation failure is a hard error; fail the task.
+      deps.task.transition(t, deps.task.FAILED,
+        "approval.create failed for '" .. skill_path .. "': " .. tostring(err))
+      return t
+    end
+
+    approval_ids[#approval_ids + 1] = record.id
+
+    -- Print promotion commands for this skill.
+    local cmds, cmds_err = deps.approval.get_promotion_commands(record, allowed_dir)
+    if cmds then
+      emit("")
+      emit("  Promote '" .. skill_name .. "':")
+      for _, cmd in ipairs(cmds) do
+        emit("    " .. cmd)
+      end
+    else
+      emit("  (could not generate promotion commands: " .. tostring(cmds_err) .. ")")
+    end
+  end
+
+  -- Store the first approval_id on the task (primary handle for resume).
+  t.approval_id = approval_ids[1]
+
+  -- Persist task state so it survives process exit.
+  if deps.state and type(deps.state.save) == "function" then
+    deps.state.save(t)
+  end
+
+  emit("")
+  emit("  Task paused for human approval.")
+  emit("  Run the promotion commands above, then:")
+  emit("    ./agent resume")
+
+  -- The task stays in APPROVAL — this is a pause point, not a transition.
+  -- run() will exit the loop because task.is_paused(t) returns true.
+  return t
+end
+
+-- ---------------------------------------------------------------------------
 -- Dispatch table
 -- ---------------------------------------------------------------------------
 
@@ -256,7 +348,8 @@ local HANDLERS = {
   [("planning")]   = handle_planning,
   [("executing")]  = handle_executing,
   [("testing")]    = handle_testing,
-  -- Remaining handlers (approval, replanning) added in 3d+.
+  [("approval")]   = handle_approval,
+  -- Remaining handlers (replanning) added in 3e+.
 }
 
 -- ---------------------------------------------------------------------------
