@@ -208,28 +208,23 @@ end)
 -- ---------------------------------------------------------------------------
 
 describe("agent.step on unhandled status", function()
-  -- Use REPLANNING: it has no handler yet (added in Step 3d+).
-  -- Walk there via raw task.transition calls to bypass handlers.
+  -- Inject a bogus status directly — all real statuses now have handlers.
 
-  it("returns nil + error for an unimplemented status", function()
+  it("returns nil + error for an unknown status", function()
     local deps = ok_deps()
     local t    = mocks.make_task_obj()
-    task.transition(t, task.PLANNING)
-    task.transition(t, task.EXECUTING)
-    task.transition(t, task.REPLANNING)
+    t.status   = "bogus_status"
     local result, err = agent.step(deps, t)
     assert.is_nil(result)
     assert.is_truthy(err:find("no handler", 1, true))
   end)
 
-  it("error mentions the current status", function()
+  it("error mentions the unknown status string", function()
     local deps = ok_deps()
     local t    = mocks.make_task_obj()
-    task.transition(t, task.PLANNING)
-    task.transition(t, task.EXECUTING)
-    task.transition(t, task.REPLANNING)
+    t.status   = "bogus_status"
     local _, err = agent.step(deps, t)
-    assert.is_truthy(err:find(task.REPLANNING, 1, true))
+    assert.is_truthy(err:find("bogus_status", 1, true))
   end)
 
 end)
@@ -988,6 +983,230 @@ describe("agent.step on APPROVAL task (approval.create fails)", function()
     agent.step(deps, t)
     local detail = t.history[#t.history].detail
     assert.is_truthy(detail:find("src/skill_a.lua", 1, true))
+  end)
+
+end)
+
+-- ===========================================================================
+-- Step 3e — handle_replanning tests
+-- ===========================================================================
+
+-- ---------------------------------------------------------------------------
+-- Helpers specific to 3e
+-- ---------------------------------------------------------------------------
+
+--- Build a task at REPLANNING status with error context populated.
+local function replanning_task(overrides)
+  overrides = overrides or {}
+  local t = mocks.make_task_obj({ prompt = overrides.prompt or "do something" })
+  task.transition(t, task.PLANNING)
+  task.transition(t, task.EXECUTING)
+  task.transition(t, task.REPLANNING)
+  t.error        = overrides.error        or "something broke"
+  t.plan_path    = overrides.plan_path    or "./old_plan.md"
+  t.plan_text    = overrides.plan_text    or "## plan\noutput: old.lua\n\n## prompt\nOld.\n"
+  t.test_results = overrides.test_results or {}
+  if overrides.attempts_replan then
+    t.attempts.replan = overrides.attempts_replan
+  end
+  return t
+end
+
+--- Shorthand: deps where replan succeeds, returning a specific path.
+local function replan_ok_deps(new_path, extra_overrides)
+  return mocks.make_agent_deps({
+    planner_overrides = { replan_path = new_path or "./new_plan.md" },
+  })
+end
+
+--- Shorthand: deps where replan fails.
+local function replan_fail_deps(err_msg)
+  return mocks.make_agent_deps({
+    planner_overrides = { replan_err = err_msg or "LLM unavailable" },
+  })
+end
+
+-- ---------------------------------------------------------------------------
+-- handle_replanning — success path
+-- ---------------------------------------------------------------------------
+
+describe("agent.step on REPLANNING task (replan succeeds)", function()
+
+  it("transitions to PLANNING on replan success", function()
+    local deps = replan_ok_deps()
+    local t    = replanning_task()
+    agent.step(deps, t)
+    assert.equals(task.PLANNING, t.status)
+  end)
+
+  it("sets t.plan_path to the new plan path", function()
+    local deps = replan_ok_deps("./plans/revised.md")
+    local t    = replanning_task()
+    agent.step(deps, t)
+    assert.equals("./plans/revised.md", t.plan_path)
+  end)
+
+  it("increments the replan attempt counter", function()
+    local deps = replan_ok_deps()
+    local t    = replanning_task()
+    agent.step(deps, t)
+    assert.equals(1, t.attempts.replan)
+  end)
+
+  it("calls planner.replan exactly once", function()
+    local deps = replan_ok_deps()
+    local t    = replanning_task()
+    agent.step(deps, t)
+    assert.equals(1, #deps.planner._replan_calls)
+  end)
+
+  it("passes the task to planner.replan", function()
+    local deps = replan_ok_deps()
+    local t    = replanning_task({ prompt = "build a parser" })
+    agent.step(deps, t)
+    assert.equals(t, deps.planner._replan_calls[1].task)
+  end)
+
+  it("clears the old plan_path before calling replan", function()
+    -- Verify that if replan fails, plan_path is nil (not stale).
+    local deps = replan_fail_deps("oops")
+    local t    = replanning_task({ plan_path = "./stale.md" })
+    agent.step(deps, t)
+    -- On failure t goes to FAILED; the stale path should have been cleared.
+    assert.is_nil(t.plan_path)
+  end)
+
+  it("after replan, handle_planning uses the new plan_path (no second LLM call)", function()
+    -- Wire a full REPLANNING → PLANNING → EXECUTING sequence via two step() calls.
+    local deps = replan_ok_deps("./new_plan.md")
+    local t    = replanning_task()
+    agent.step(deps, t)          -- REPLANNING → PLANNING (sets plan_path)
+    assert.equals(task.PLANNING, t.status)
+    agent.step(deps, t)          -- PLANNING → EXECUTING (short-circuit, no generate call)
+    assert.equals(task.EXECUTING, t.status)
+    -- planner.generate should NOT have been called (only replan was).
+    assert.equals(0, #deps.planner._generate_calls)
+  end)
+
+end)
+
+-- ---------------------------------------------------------------------------
+-- handle_replanning — error_info passed to planner.replan
+-- ---------------------------------------------------------------------------
+
+describe("agent.step on REPLANNING task (error_info contents)", function()
+
+  it("error_info.message contains t.error", function()
+    local deps = replan_ok_deps()
+    local t    = replanning_task({ error = "assertion #3 failed" })
+    agent.step(deps, t)
+    local ei = deps.planner._replan_calls[1].error_info
+    assert.is_truthy(ei.message:find("assertion #3 failed", 1, true))
+  end)
+
+  it("error_info.plan_text contains the previous plan text", function()
+    local deps = replan_ok_deps()
+    local t    = replanning_task({ plan_text = "## plan\noutput: foo.lua\n\n## prompt\nOld.\n" })
+    agent.step(deps, t)
+    local ei = deps.planner._replan_calls[1].error_info
+    assert.equals("## plan\noutput: foo.lua\n\n## prompt\nOld.\n", ei.plan_text)
+  end)
+
+  it("error_info.test_output includes output from failing test_results", function()
+    local test_results = {
+      { skill_path = "src/s.lua", test_path = "src/s.test.lua",
+        passed = false, output = "FAILED: expected 1 got 2" },
+    }
+    local deps = replan_ok_deps()
+    local t    = replanning_task({ test_results = test_results })
+    agent.step(deps, t)
+    local ei = deps.planner._replan_calls[1].error_info
+    assert.is_truthy(ei.test_output:find("expected 1 got 2", 1, true))
+  end)
+
+  it("error_info.test_output is nil when all tests passed", function()
+    local test_results = {
+      { skill_path = "src/s.lua", test_path = "src/s.test.lua",
+        passed = true, output = "ok" },
+    }
+    local deps = replan_ok_deps()
+    local t    = replanning_task({ test_results = test_results })
+    agent.step(deps, t)
+    local ei = deps.planner._replan_calls[1].error_info
+    assert.is_nil(ei.test_output)
+  end)
+
+  it("error_info.test_output is nil when test_results is empty", function()
+    local deps = replan_ok_deps()
+    local t    = replanning_task({ test_results = {} })
+    agent.step(deps, t)
+    local ei = deps.planner._replan_calls[1].error_info
+    assert.is_nil(ei.test_output)
+  end)
+
+end)
+
+-- ---------------------------------------------------------------------------
+-- handle_replanning — failure path
+-- ---------------------------------------------------------------------------
+
+describe("agent.step on REPLANNING task (replan fails)", function()
+
+  it("transitions to FAILED when planner.replan fails", function()
+    local deps = replan_fail_deps("LLM unavailable")
+    local t    = replanning_task()
+    agent.step(deps, t)
+    assert.equals(task.FAILED, t.status)
+  end)
+
+  it("sets t.error to the replan error message", function()
+    local deps = replan_fail_deps("context window exceeded")
+    local t    = replanning_task()
+    agent.step(deps, t)
+    assert.is_truthy(t.error:find("context window exceeded", 1, true))
+  end)
+
+  it("still increments the replan attempt counter on failure", function()
+    local deps = replan_fail_deps("oops")
+    local t    = replanning_task()
+    agent.step(deps, t)
+    assert.equals(1, t.attempts.replan)
+  end)
+
+end)
+
+-- ---------------------------------------------------------------------------
+-- handle_planning short-circuit (plan_path already set by replan)
+-- ---------------------------------------------------------------------------
+
+describe("agent.step on PLANNING task (plan_path pre-set by replan)", function()
+
+  it("transitions directly to EXECUTING without calling planner.generate", function()
+    local deps = mocks.make_agent_deps()
+    local t    = mocks.make_task_obj()
+    task.transition(t, task.PLANNING)
+    t.plan_path = "./already_replanned.md"
+    agent.step(deps, t)
+    assert.equals(task.EXECUTING, t.status)
+    assert.equals(0, #deps.planner._generate_calls)
+  end)
+
+  it("preserves the pre-set plan_path", function()
+    local deps = mocks.make_agent_deps()
+    local t    = mocks.make_task_obj()
+    task.transition(t, task.PLANNING)
+    t.plan_path = "./already_replanned.md"
+    agent.step(deps, t)
+    assert.equals("./already_replanned.md", t.plan_path)
+  end)
+
+  it("does not bump the plan attempt counter", function()
+    local deps = mocks.make_agent_deps()
+    local t    = mocks.make_task_obj()
+    task.transition(t, task.PLANNING)
+    t.plan_path = "./already_replanned.md"
+    agent.step(deps, t)
+    assert.equals(0, t.attempts.plan)
   end)
 
 end)

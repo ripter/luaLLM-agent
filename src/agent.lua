@@ -8,6 +8,7 @@
 --- Step 3b: handle_executing.
 --- Step 3c: handle_testing.
 --- Step 3d: handle_approval.
+--- Step 3e: handle_replanning.
 
 local _src = debug.getinfo(1, "S").source:match("^@(.*/)") or "./"
 package.path = _src .. "?.lua;" .. package.path
@@ -62,6 +63,15 @@ end
 -- ---------------------------------------------------------------------------
 
 local function handle_planning(deps, t)
+  -- Fast-path: handle_replanning sets t.plan_path before transitioning back
+  -- here, meaning a new plan.md is already on disk and validated.
+  -- Skip the LLM call and go straight to EXECUTING.
+  if t.plan_path then
+    deps.task.transition(t, deps.task.EXECUTING,
+      "using existing plan: " .. t.plan_path)
+    return t
+  end
+
   deps.task.bump_attempt(t, "plan")
 
   local plan_path, result = deps.planner.generate(deps, t.prompt, {
@@ -81,9 +91,7 @@ local function handle_planning(deps, t)
   t.error = err
 
   -- PLANNING can only transition to EXECUTING or FAILED (see task.lua TRANSITIONS).
-  -- When the planner fails we always go to FAILED here.  The retry logic lives
-  -- in handle_replanning (Step 3b): REPLANNING → PLANNING re-enters this handler
-  -- if attempts.plan < max_attempts.plan.
+  -- When the planner fails we always go to FAILED here.
   local detail = deps.task.can_retry(t, "plan")
     and ("planning failed (attempt " .. t.attempts.plan .. ", will retry): " .. err)
     or  ("planning failed (no retries left): " .. err)
@@ -340,6 +348,55 @@ local function handle_approval(deps, t)
 end
 
 -- ---------------------------------------------------------------------------
+-- Handler: REPLANNING → PLANNING | FAILED
+-- ---------------------------------------------------------------------------
+
+local function handle_replanning(deps, t)
+  deps.task.bump_attempt(t, "replan")
+
+  -- Build error_info from what the task recorded during testing/executing.
+  local error_info = {
+    phase     = "testing",
+    message   = t.error or "unknown error",
+    plan_text = t.plan_text,
+  }
+
+  -- Attach test output if any tests were recorded.
+  if type(t.test_results) == "table" and #t.test_results > 0 then
+    local parts = {}
+    for _, r in ipairs(t.test_results) do
+      if not r.passed then
+        parts[#parts + 1] = (r.skill_path or r.test_path or "?") .. ":\n" .. (r.output or "")
+      end
+    end
+    if #parts > 0 then
+      error_info.test_output = table.concat(parts, "\n---\n")
+    end
+  end
+
+  -- Clear the old plan_path so handle_planning does not short-circuit on the
+  -- stale path; replan will set a new one below.
+  t.plan_path = nil
+  t.plan_text = nil
+
+  local plan_path, result = deps.planner.replan(deps, t, error_info)
+
+  if plan_path then
+    t.plan_path = plan_path
+    t.plan_text = read_plan_text(plan_path) or nil
+    deps.task.transition(t, deps.task.PLANNING,
+      "replan succeeded: " .. plan_path)
+    return t
+  end
+
+  local err = tostring(result)
+  t.error = err
+  deps.task.transition(t, deps.task.FAILED,
+    "replan failed: " .. err)
+  return t
+end
+
+-- ---------------------------------------------------------------------------
 -- Dispatch table
 -- ---------------------------------------------------------------------------
 
@@ -349,7 +406,8 @@ local HANDLERS = {
   [("executing")]  = handle_executing,
   [("testing")]    = handle_testing,
   [("approval")]   = handle_approval,
-  -- Remaining handlers (replanning) added in 3e+.
+  [("replanning")] = handle_replanning,
+  -- All handlers registered.
 }
 
 -- ---------------------------------------------------------------------------
