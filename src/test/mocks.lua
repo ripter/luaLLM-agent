@@ -510,7 +510,8 @@ end
 ---   save_err     — error string for save()
 function M.make_state(overrides)
   overrides = overrides or {}
-  local saved = {}
+  local saved   = {}
+  local cleared = { count = 0 }
   return {
     load = function()
       if overrides.task_to_load then return overrides.task_to_load, nil end
@@ -523,7 +524,14 @@ function M.make_state(overrides)
       return true, nil
     end,
 
-    _saved = saved,
+    clear = function()
+      cleared.count = cleared.count + 1
+      if overrides.clear_err then return nil, overrides.clear_err end
+      return true, nil
+    end,
+
+    _saved   = saved,
+    _cleared = cleared,
   }
 end
 
