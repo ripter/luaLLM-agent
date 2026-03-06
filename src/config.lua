@@ -63,6 +63,10 @@ local DEFAULT_CONFIG = {
     max_files   = 5,
   },
 
+  agent = {
+    output_dir = "~/agent_wrote",
+  },
+
   luallm = {
     binary     = "luallm",
     auto_start = false,
@@ -173,6 +177,17 @@ function M.validate(cfg)
     end
   end
 
+  -- agent
+  if cfg.agent ~= nil then
+    if type(cfg.agent) ~= "table" then
+      err("agent must be a table")
+    else
+      if cfg.agent.output_dir ~= nil and type(cfg.agent.output_dir) ~= "string" then
+        err("agent.output_dir must be a string")
+      end
+    end
+  end
+
   -- luallm
   if cfg.luallm ~= nil then
     if type(cfg.luallm) ~= "table" then
@@ -232,6 +247,24 @@ local function enforce_invariants(cfg)
   if cfg.approvals then
     cfg.approvals.skill_promotion = "manual"
   end
+
+  -- Automatically ensure agent.output_dir is covered by allowed_paths so the
+  -- human doesn't have to manually add every task subdirectory.
+  local output_dir = cfg.agent and cfg.agent.output_dir
+  if type(output_dir) == "string" and output_dir ~= "" then
+    local expanded = lfs and output_dir or output_dir  -- expand_tilde runs later
+    -- Use a glob that covers all task subdirs: <output_dir>/*
+    local glob = output_dir:gsub("/*$", "") .. "/*"
+    local found = false
+    for _, p in ipairs(cfg.allowed_paths or {}) do
+      if p == output_dir or p == glob then found = true; break end
+    end
+    if not found then
+      cfg.allowed_paths = cfg.allowed_paths or {}
+      cfg.allowed_paths[#cfg.allowed_paths + 1] = glob
+    end
+  end
+
   return cfg
 end
 

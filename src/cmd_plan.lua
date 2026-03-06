@@ -98,7 +98,8 @@ end
 -- Shared: print test_runner note
 -- ---------------------------------------------------------------------------
 
-local function note_test_runner(plan_table, emit)
+local function note_test_runner(plan_table, emit, deps)
+  if deps and deps.suppress_test_runner_note then return end
   if plan_table.test_runner then
     emit("  Test runner requested: " .. plan_table.test_runner
          .. " (not executed by plan runner)")
@@ -190,7 +191,7 @@ local function run_run(plan_path, deps)
       return nil, "generate failed: " .. tostring(info)
     end
     emit("  ✓  (" .. (info.model or "?") .. ", " .. (info.tokens or "?") .. " tokens)")
-    note_test_runner(plan_table, emit)
+    note_test_runner(plan_table, emit, deps)
     emit("")
     return true
   end
@@ -217,7 +218,7 @@ local function run_run(plan_path, deps)
     return nil, "outputs missing after run:\n  " .. table.concat(missing, "\n  ")
   end
 
-  note_test_runner(plan_table, emit)
+  note_test_runner(plan_table, emit, deps)
   emit("")
 
   return true
@@ -281,7 +282,7 @@ local function run_resume(plan_path, deps)
     return nil, "outputs still missing after resume:\n  " .. table.concat(still_missing, "\n  ")
   end
 
-  note_test_runner(plan_table, emit)
+  note_test_runner(plan_table, emit, deps)
   emit("")
 
   return true

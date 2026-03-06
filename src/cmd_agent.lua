@@ -19,9 +19,13 @@ local M = {}
 -- ---------------------------------------------------------------------------
 
 local function default_deps()
+  local state  = require("state")
+  local config = require("config")
+  config.load()
+  state.init(config.default_dir() .. "/state")
   return {
     agent = require("agent"),
-    state = require("state"),
+    state = state,
     print = _G.print,
   }
 end
@@ -70,7 +74,7 @@ function M.run(deps, args)
 
   emit(deps, "  Starting agent task: " .. prompt)
 
-  local t = deps.agent.run(deps, prompt, {
+  local t = deps.agent.run(nil, prompt, {
     context_files = args.context_files or {},
   })
 
@@ -80,8 +84,32 @@ function M.run(deps, args)
   end
 
   emit(deps, "  Task " .. (t.id or "?") .. " finished with status: " .. (t.status or "?"))
-  if t.error then
-    emit(deps, "  Error: " .. t.error)
+
+  if t.status == "awaiting_human" then
+    -- The action-required message was already printed by the agent during execution.
+    -- Just show a brief status line and the next step.
+    emit(deps, "")
+    emit(deps, "  ⚠  Task paused — action required.")
+    if t.human_action then
+      emit(deps, "     " .. t.human_action:gsub("\n", "\n     "))
+    end
+    emit(deps, "")
+    emit(deps, "  Once done, run:  ./agent agent resume")
+  elseif t.error then
+    local err = t.error
+    if t.status == "failed" and err:find("model not found in luallm state", 1, true) then
+      emit(deps, "")
+      emit(deps, "  ⚠  luallm is running but no model is loaded.")
+      emit(deps, "     Open the luallm UI and load a model, then retry.")
+      emit(deps, "  Raw error: " .. err)
+    elseif t.status == "failed" and err:find("LLM call failed", 1, true) then
+      emit(deps, "")
+      emit(deps, "  ⚠  Could not reach luallm. Is the server running?")
+      emit(deps, "     Run:  ./agent doctor   — to check your environment.")
+      emit(deps, "  Raw error: " .. err)
+    else
+      emit(deps, "  Error: " .. err)
+    end
   end
 
   return t
@@ -106,7 +134,7 @@ function M.resume(deps, _args)
   emit(deps, "  Resuming task " .. (t.id or "?")
        .. " (status: " .. (t.status or "?") .. ")")
 
-  local result = deps.agent.resume(deps, t)
+  local result = deps.agent.resume(nil, t)
 
   if not result then
     emit(deps, "  Error: agent.resume returned nil")
@@ -154,7 +182,15 @@ function M.status(deps, _args)
   emit(deps, "  Task:    " .. (t.id     or "?"))
   emit(deps, "  Prompt:  " .. (t.prompt or "?"))
   emit(deps, "  Status:  " .. (t.status or "?"))
-  if t.error then
+  if t.status == "awaiting_human" and t.human_action then
+    emit(deps, "")
+    emit(deps, "  ⚠  Waiting for you to:")
+    emit(deps, "     " .. t.human_action:gsub("\n", "\n     "))
+    emit(deps, "")
+    emit(deps, "  Then run:  ./agent agent resume")
+    emit(deps, "")
+  end
+  if t.error and t.status ~= "awaiting_human" then
     emit(deps, "  Error:   " .. t.error)
   end
 

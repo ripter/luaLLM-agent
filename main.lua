@@ -281,6 +281,122 @@ end
 -- Command registry
 -- ---------------------------------------------------------------------------
 
+-- ---------------------------------------------------------------------------
+-- Command: agent
+-- ---------------------------------------------------------------------------
+
+local function run_agent(args)
+  local cmd_agent  = require("cmd_agent")
+  local subcommand = args.subcommand
+
+  if subcommand == "run" then
+    local prompt = args.prompt
+    if type(prompt) == "table" then prompt = prompt[1] end
+
+    if not prompt or prompt == "" then
+      print("")
+      print(co("%{red}", "  ✗ agent run requires a prompt"))
+      print("  Run " .. co("%{cyan}", "lua main.lua help agent") .. " for usage.")
+      print("")
+      os.exit(1)
+    end
+
+    print("")
+    print(co("%{bright magenta}", "  agent run") .. co("%{dim}", " — " .. prompt))
+    print("")
+
+    local t = cmd_agent.run(nil, {
+      prompt        = prompt,
+      context_files = args.context or {},
+    })
+
+    if not t then
+      print(co("%{red}", "  ✗ agent.run returned nil"))
+      print("")
+      os.exit(1)
+    end
+
+    print("")
+    if t.status == "complete" then
+      print(co("%{bright green}", "  ✓ ") .. co("%{bright white}", "Task complete"))
+    elseif t.status == "approval" then
+      print(co("%{bright cyan}", "  ⏸  ") .. co("%{bright white}", "Task paused — run the commands above, then:"))
+      print(co("%{dim}", "       ./agent agent resume"))
+    else
+      print(co("%{red}", "  ✗ ") .. co("%{bright white}", "Task ended: ") .. (t.status or "?"))
+      if t.error then
+        local err = t.error
+        if err:find("model not found in luallm state", 1, true) then
+          print("")
+          print(co("%{yellow}", "  ⚠  luallm is running but no model is loaded."))
+          print(co("%{dim}",    "     Open the luallm UI and load a model, then retry."))
+        elseif err:find("LLM call failed", 1, true) then
+          print("")
+          print(co("%{yellow}", "  ⚠  Could not reach luallm. Is the server running?"))
+          print(co("%{dim}",    "     Run: ./agent doctor  — to check your environment"))
+        elseif err:find("write denied", 1, true) or err:find("allowed_paths", 1, true) then
+          print("")
+          print(co("%{yellow}", "  ⚠  Write denied: a required path is not in allowed_paths."))
+          print(co("%{dim}",    "     The agent needs write access to your state directory:"))
+          local config = require("config")
+          pcall(config.load)
+          local state_dir = config.default_dir() .. "/state"
+          print(co("%{cyan}",   '     Add to config.json: "allowed_paths": ["' .. state_dir .. '", ...]'))
+          print(co("%{dim}",    "     Run: ./agent doctor  — for a full diagnosis"))
+          print(co("%{dim}",    "     Run: ./agent help agent  — for setup instructions"))
+        else
+          print(co("%{yellow}", "    " .. err))
+        end
+      end
+      os.exit(1)
+    end
+    print("")
+
+  elseif subcommand == "resume" then
+    print("")
+    print(co("%{bright magenta}", "  agent resume"))
+    print("")
+    local result, err = cmd_agent.resume(nil)
+    if not result then
+      print(co("%{red}", "  ✗ ") .. tostring(err))
+      print("")
+      os.exit(1)
+    end
+    print("")
+
+  elseif subcommand == "reset" then
+    print("")
+    print(co("%{bright magenta}", "  agent reset"))
+    print("")
+    local ok, err = cmd_agent.reset(nil)
+    if not ok then
+      print(co("%{red}", "  ✗ ") .. tostring(err))
+      print("")
+      os.exit(1)
+    end
+    print("")
+
+  elseif subcommand == "status" then
+    print("")
+    print(co("%{bright magenta}", "  agent status"))
+    print("")
+    local t, err = cmd_agent.status(nil)
+    if not t then
+      print(co("%{red}", "  ✗ ") .. tostring(err))
+      print("")
+      os.exit(1)
+    end
+    print("")
+
+  else
+    print("")
+    print(co("%{red}", "  ✗ Unknown subcommand: ") .. co("%{bright white}", tostring(subcommand)))
+    print("  Run " .. co("%{cyan}", "lua main.lua help agent") .. " for usage.")
+    print("")
+    os.exit(1)
+  end
+end
+
 local COMMANDS = {
   {
     name  = "test",
@@ -439,6 +555,70 @@ local COMMANDS = {
     - Tests are NOT executed automatically by the plan runner.
     ]],
   },
+  {
+    name  = "agent",
+    usage = "<run|resume|reset|status> [prompt]",
+    desc  = "Run the autonomous agent loop.",
+    fn    = run_agent,
+    setup = function(parser)
+      parser:argument("subcommand", "Subcommand: run, resume, reset, or status.")
+      parser:argument("prompt", "What to do (required for 'run')."):args("?")
+      parser:option("--context", "Context file(s) to pass to the agent."):args("*")
+    end,
+    detail = [[
+  Subcommands:
+    run     Start a new agent task from a prompt.
+    resume  Resume a paused task waiting for skill approval.
+    reset   Clear saved task state.
+    status  Print the current task status and history.
+
+  Quickstart:
+    ./agent agent run    "write a module that parses INI files"
+    ./agent agent status
+    ./agent agent resume
+    ./agent agent reset
+
+  The agent loop:
+    run      Generates a plan.md, executes it, runs tests, and if skills are
+             produced, creates an approval record and pauses for human review.
+    resume   After you have manually promoted a skill (copied it to the
+             allowed skills directory), resume to mark the task complete.
+    reset    Discards the saved task so you can start fresh with a new prompt.
+    status   Shows the task id, prompt, current status, and transition history.
+
+  Context files:
+    Pass --context to give the agent additional source files to read before
+    planning. Useful when the generated code should call existing modules:
+      ./agent agent run "add caching to the config loader" \
+        --context src/config.lua src/safe_fs.lua
+
+  Required configuration — allowed_paths:
+    The agent writes plan files to your state directory:
+      ~/.config/luallmagent/state/
+
+    This path MUST appear in allowed_paths in your config.json or the agent
+    will fail with a write-denied error. allowed_paths is fully controlled by
+    you and is never modified automatically by the program.
+
+    Add it to config.json:
+      "allowed_paths": [
+        "/Users/you/.config/luallmagent/state",
+        "/path/to/your/project"
+      ]
+
+    Run ./agent doctor to check whether this is configured correctly.
+
+  Approval flow:
+    When the agent produces a skill and all tests pass, it prints shell commands
+    to promote the skill to your allowed skills directory, then pauses:
+
+      cp /tmp/my_skill.lua /path/to/skills/my_skill.lua
+      chmod 644 /path/to/skills/my_skill.lua
+
+    Review the code, run the commands, then:
+      ./agent agent resume
+    ]],
+  },
 }
 
 -- ---------------------------------------------------------------------------
@@ -456,12 +636,9 @@ local function print_help(cmd_name)
         print("  " .. cmd.desc)
         if cmd.detail then
           print("")
-          -- detail is a multiline string; print each line with dim styling
-          -- for the section headers and normal text for the rest.
           for line in (cmd.detail):gmatch("([^\n]*)\n?") do
             local trimmed = line:match("^%s*(.-)%s*$")
             if trimmed:match("^%u%l+:") or trimmed:match("^%u[%u%s]+:") then
-              -- "Arguments:", "Options:", etc — print as a bright header
               print(co("%{bright white}", "  " .. line))
             else
               print(co("%{dim}", line))
@@ -480,7 +657,7 @@ local function print_help(cmd_name)
   end
 
   print("")
-  print(co("%{bright magenta}", "  luaLLM-agent") .. co("%{dim}", " — a Lua LLM agent framework"))
+  print(co("%{bright magenta}", "  luaLLM-agent") .. co("%{dim}", " â a Lua LLM agent framework"))
   print("")
   print(co("%{bright white}", "  Usage:"))
   print("    " .. co("%{cyan}", "lua main.lua") .. " " .. co("%{bright white}", "<command>") .. " [options]")

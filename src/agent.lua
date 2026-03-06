@@ -22,16 +22,22 @@ local M = {}
 -- ---------------------------------------------------------------------------
 
 local function default_deps()
+  local state  = require("state")
+  local config = require("config")
+  config.load()           -- requires load() before get()
+  state.init(config.default_dir() .. "/state")   -- absolute path must match allowed_paths
   return {
     task         = require("task"),
     planner      = require("planner"),
     cmd_plan     = require("cmd_plan"),
+    cmd_generate         = require("cmd_generate"),
+    cmd_generate_context = require("cmd_generate_context"),
     plan         = require("plan"),
     skill_loader = require("skill_loader"),
     skill_runner = require("skill_runner"),
     approval     = require("approval"),
-    state        = require("state"),
-    config       = require("config"),
+    state        = state,
+    config       = config,
     luallm       = require("luallm"),
     safe_fs      = require("safe_fs"),
     print        = _G.print,
@@ -52,12 +58,68 @@ local function read_plan_text(plan_path)
 end
 
 -- ---------------------------------------------------------------------------
+-- Task output directory
+-- ---------------------------------------------------------------------------
+
+--- Derive and create the per-task output directory: <agent.output_dir>/<task_id>/
+--- Stores the result on t.output_dir. Returns (dir, nil) or (nil, err).
+local function ensure_task_output_dir(deps, t)
+  if t.output_dir then
+    return t.output_dir, nil
+  end
+  local util = require("util")
+  local base = deps.config.get("agent.output_dir") or "~/agent_wrote"
+  base = util.expand_tilde(base)
+  local dir = base .. "/" .. (t.id or "task")
+  local ok, err = util.mkdir_p(dir)
+  if not ok then
+    return nil, "could not create task output dir '" .. dir .. "': " .. tostring(err)
+  end
+  t.output_dir = dir
+  return dir, nil
+end
+
+-- ---------------------------------------------------------------------------
 -- Handler: PENDING → PLANNING
 -- ---------------------------------------------------------------------------
 
 local function handle_pending(deps, t)
+  local _, err = ensure_task_output_dir(deps, t)
+  if err then
+    deps.task.transition(t, deps.task.FAILED, err)
+    return t
+  end
   deps.task.transition(t, deps.task.PLANNING, "starting")
   return t
+end
+
+-- ---------------------------------------------------------------------------
+-- Rewrite relative output paths in a plan file to be absolute under task_dir
+-- ---------------------------------------------------------------------------
+
+--- Read plan.md, rewrite any relative `output:` lines to absolute paths
+--- under task_dir, and write it back. Returns (true, nil) or (nil, err).
+local function rewrite_output_paths(plan_path, task_dir)
+  local util = require("util")
+  local raw, err = util.read_file(plan_path)
+  if not raw then
+    return nil, "rewrite_output_paths: cannot read " .. plan_path .. ": " .. tostring(err)
+  end
+
+  local rewritten = raw:gsub("(output:%s*)([^\n]+)", function(prefix, path)
+    path = path:match("^%s*(.-)%s*$")
+    -- Leave absolute paths alone
+    if path:sub(1, 1) == "/" or path:sub(1, 1) == "~" then
+      return prefix .. path
+    end
+    return prefix .. task_dir .. "/" .. path
+  end)
+
+  local ok, werr = util.write_file_atomic(plan_path, rewritten)
+  if not ok then
+    return nil, "rewrite_output_paths: cannot write " .. plan_path .. ": " .. tostring(werr)
+  end
+  return true, nil
 end
 
 -- ---------------------------------------------------------------------------
@@ -78,9 +140,18 @@ local function handle_planning(deps, t)
 
   local plan_path, result = deps.planner.generate(deps, t.prompt, {
     context_files = t.context_files,
+    output_dir    = t.output_dir or (deps.config.default_dir() .. "/state"),
   })
 
   if plan_path then
+    -- Rewrite relative output: paths to be absolute under the task output dir.
+    if t.output_dir then
+      local _, rw_err = rewrite_output_paths(plan_path, t.output_dir)
+      if rw_err then
+        deps.task.transition(t, deps.task.FAILED, rw_err)
+        return t
+      end
+    end
     -- Success: record plan location and content, advance to EXECUTING.
     t.plan_path = plan_path
     t.plan_text = read_plan_text(plan_path) or (type(result) == "string" and result or nil)
@@ -108,15 +179,22 @@ end
 
 --- Build the deps table that cmd_plan.run() expects, bridging from agent deps.
 local function make_cmd_plan_deps(deps)
+  local lfs = require("lfs")
   return {
-    plan                 = deps.plan,
-    globber              = deps.plan.default_globber,
-    cmd_generate_context = deps.cmd_generate_context,
-    cmd_generate         = deps.cmd_generate,
-    luallm               = deps.luallm,
-    safe_fs              = deps.safe_fs,
-    config               = deps.config,
-    fs                   = deps.fs or { exists = function(_) return false end },
+    plan                    = deps.plan,
+    globber                 = deps.plan.default_globber,
+    cmd_generate_context    = deps.cmd_generate_context,
+    cmd_generate            = deps.cmd_generate,
+    luallm                  = deps.luallm,
+    safe_fs                 = deps.safe_fs,
+    config                  = deps.config,
+    suppress_test_runner_note = true,
+    fs                      = deps.fs or {
+      exists = function(path)
+        local attr = lfs.attributes(path)
+        return attr ~= nil and attr.mode == "file"
+      end
+    },
     print                = deps.print or function(_) end,
   }
 end
@@ -154,6 +232,101 @@ local function handle_executing(deps, t)
 
   local output_paths = (plan_table and plan_table.outputs) or t.outputs or {}
   t.outputs = output_paths
+
+  -- Run the test_runner command if declared, for plain codegen tasks.
+  -- For skill tasks this happens in handle_testing via skill_runner.run_tests.
+  if plan_table and plan_table.test_runner and plan_table.test_runner ~= "" then
+    local emit = deps.print or function(_) end
+    local runner = plan_table.test_runner
+
+    -- Run from the task output directory so relative paths work.
+    local run_dir = t.output_dir or "."
+    local safe_runner = runner:gsub("'", "'\\''")
+    local cmd = string.format("cd '%s' && %s 2>&1", run_dir, safe_runner)
+
+    emit("  running test_runner: " .. runner)
+    local handle = io.popen(cmd, "r")
+    local output = handle and handle:read("*a") or ""
+    local pok, _, exit_code = handle and handle:close()
+    exit_code = (type(pok) == "number") and pok or (exit_code or (pok and 0 or 1))
+
+    if exit_code ~= 0 then
+      local err_msg = "test_runner '" .. runner .. "' failed (exit " .. tostring(exit_code) .. "):\n" .. output
+
+      -- Detect errors that require human action rather than LLM retry.
+      local human_action = nil
+      local lower_output = output:lower()
+
+      -- Extract explicit luarocks hint first
+      local explicit_rock = output:match("luarocks install ([%w%-_%.]+)")
+
+      -- Extract missing module name from Lua's "module 'x' not found" message
+      local missing_module = output:match("module '([^']+)' not found")
+
+      -- Map known module names to their luarocks package names
+      local MODULE_TO_ROCK = {
+        ["luasql.sqlite3"]  = "luasql-sqlite3",
+        ["luasql.mysql"]    = "luasql-mysql",
+        ["luasql.postgres"] = "luasql-postgres",
+        ["cjson"]           = "lua-cjson",
+        ["cjson.safe"]      = "lua-cjson",
+        ["lfs"]             = "luafilesystem",
+        ["socket"]          = "luasocket",
+        ["socket.http"]     = "luasocket",
+        ["ltn12"]           = "luasocket",
+        ["ssl"]             = "luasec",
+        ["inspect"]         = "inspect",
+        ["argparse"]        = "argparse",
+        ["penlight"]        = "penlight",
+        ["pl.path"]         = "penlight",
+        ["uuid"]            = "uuid",
+        ["lsqlite3"]        = "lsqlite3",
+      }
+
+      if explicit_rock or missing_module then
+        local rock = explicit_rock
+                  or (missing_module and MODULE_TO_ROCK[missing_module])
+                  or (missing_module and missing_module:gsub("%.", "-"):gsub("/", "-"))
+        human_action = "Missing Lua dependency: " .. (missing_module or rock) .. "\n"
+                    .. "Install it with:\n"
+                    .. "     luarocks install " .. rock
+      elseif lower_output:match("permission denied") then
+        human_action = "Permission denied. Check file/directory permissions."
+      elseif lower_output:match("command not found") or lower_output:match("no such file or directory") then
+        local missing = output:match("([^:'\n]+): command not found")
+                     or output:match("([^:'\n]+): [Nn]o such file")
+        human_action = "Required command not found: " .. (missing or "unknown") .. "\nInstall it and then run: ./agent agent resume"
+      end
+
+      if human_action then
+        t.error = err_msg
+        t.human_action = human_action
+        emit("")
+        emit("  ⚠  Action required before the agent can continue:")
+        emit("     " .. human_action:gsub("\n", "\n     "))
+        emit("")
+        emit("  Once done, run:  ./agent agent resume")
+        deps.task.transition(t, deps.task.AWAITING_HUMAN,
+          "human action required: " .. human_action)
+        return t
+      end
+
+      t.error = err_msg
+      emit("  ✗ test_runner failed (exit " .. tostring(exit_code) .. "):")
+      emit("    " .. output:gsub("\n", "\n    "):match("^(.-)%s*$"))
+      if deps.task.can_retry(t, "plan") then
+        deps.task.transition(t, deps.task.REPLANNING,
+          "test_runner failed (will retry): " .. err_msg)
+      else
+        deps.task.transition(t, deps.task.FAILED,
+          "test_runner failed (no retries left): " .. err_msg)
+      end
+      return t
+    end
+
+    emit("  ✓ test_runner passed")
+    t.error = nil
+  end
 
   -- Scan each output for @skill metadata.  Any file that parses successfully
   -- as a skill is added to t.skill_files.
@@ -362,6 +535,27 @@ end
 -- Handler: REPLANNING → PLANNING | FAILED
 -- ---------------------------------------------------------------------------
 
+local LIBRARY_API_HINTS = {
+  lsqlite3 = [[
+lsqlite3 correct API (NOT luasql):
+  local sqlite3 = require("lsqlite3")
+  local db = sqlite3.open("file.db")          -- returns db object (NOT env:open)
+  db:exec("CREATE TABLE ...")                  -- for DDL with no results
+  local stmt = db:prepare("SELECT ...")        -- returns stmt
+  stmt:step()                                  -- advance; returns sqlite3.ROW or sqlite3.DONE
+  stmt:get_value(0)                            -- get column 0 of current row
+  stmt:reset()                                 -- reset for re-use
+  stmt:finalize()                              -- close statement
+  db:close()
+  -- For INSERT with bound params:
+  local stmt = db:prepare("INSERT INTO t VALUES (?)")
+  stmt:bind(1, value)
+  stmt:step()
+  stmt:finalize()
+  -- Do NOT use :get(), :get_integer(), :fetch(), :Prepare(), :Execute(), :Close()
+  -- Those are luasql methods. lsqlite3 is a completely different library.]],
+}
+
 local function handle_replanning(deps, t)
   deps.task.bump_attempt(t, "replan")
 
@@ -385,14 +579,33 @@ local function handle_replanning(deps, t)
     end
   end
 
+  -- If the error mentions a known library, inject a correct API reference so
+  -- the LLM stops hallucinating methods from a different library.
+  local err_text = (t.error or "") .. (error_info.test_output or "")
+  for lib, hint in pairs(LIBRARY_API_HINTS) do
+    if err_text:find(lib, 1, true) then
+      error_info.message = error_info.message .. "\n\nAPI reference for " .. lib .. ":\n" .. hint
+      break
+    end
+  end
+
   -- Clear the old plan_path so handle_planning does not short-circuit on the
   -- stale path; replan will set a new one below.
   t.plan_path = nil
   t.plan_text = nil
 
-  local plan_path, result = deps.planner.replan(deps, t, error_info)
+  local plan_path, result = deps.planner.replan(deps, t, error_info, {
+    output_dir = t.output_dir or (deps.config.default_dir() .. "/state"),
+  })
 
   if plan_path then
+    if t.output_dir then
+      local _, rw_err = rewrite_output_paths(plan_path, t.output_dir)
+      if rw_err then
+        deps.task.transition(t, deps.task.FAILED, rw_err)
+        return t
+      end
+    end
     t.plan_path = plan_path
     t.plan_text = read_plan_text(plan_path) or nil
     deps.task.transition(t, deps.task.PLANNING,
@@ -408,17 +621,28 @@ local function handle_replanning(deps, t)
 end
 
 -- ---------------------------------------------------------------------------
+-- Handler: AWAITING_HUMAN (paused — human must act then resume)
+-- ---------------------------------------------------------------------------
+
+-- This is a no-op handler: the task is paused and is_paused() returns true,
+-- so the run() loop will exit before calling step() again. It's registered
+-- so that step() doesn't error if called directly (e.g. in tests).
+local function handle_awaiting_human(_deps, t)
+  return t
+end
+
+-- ---------------------------------------------------------------------------
 -- Dispatch table
 -- ---------------------------------------------------------------------------
 
 local HANDLERS = {
-  [("pending")]    = handle_pending,
-  [("planning")]   = handle_planning,
-  [("executing")]  = handle_executing,
-  [("testing")]    = handle_testing,
-  [("approval")]   = handle_approval,
-  [("replanning")] = handle_replanning,
-  -- All handlers registered.
+  [("pending")]        = handle_pending,
+  [("planning")]       = handle_planning,
+  [("executing")]      = handle_executing,
+  [("testing")]        = handle_testing,
+  [("approval")]       = handle_approval,
+  [("awaiting_human")] = handle_awaiting_human,
+  [("replanning")]     = handle_replanning,
 }
 
 -- ---------------------------------------------------------------------------
@@ -546,9 +770,55 @@ function M.resume(deps, task_obj, opts)
     return nil, "agent.resume: task_obj must be a table"
   end
 
+  -- If the task is in a non-terminal, non-paused status (e.g. crashed mid-flight
+  -- while executing or planning), re-drive it through the state machine.
   if task_obj.status ~= deps.task.APPROVAL then
+    if deps.task.is_terminal(task_obj) then
+      emit("  Task is already in terminal status '" .. tostring(task_obj.status)
+           .. "' — nothing to resume.")
+      return task_obj
+    end
+
+    -- AWAITING_HUMAN: the human has completed the required action.
+    -- Remind them what was needed, then transition back to EXECUTING.
+    if task_obj.status == deps.task.AWAITING_HUMAN then
+      if task_obj.human_action then
+        emit("  Resuming after human action:")
+        emit("     " .. task_obj.human_action:gsub("\n", "\n     "))
+      end
+      task_obj.human_action = nil
+      task_obj.error        = nil
+      deps.task.transition(task_obj, deps.task.EXECUTING, "resuming after human action")
+      if deps.state and type(deps.state.save) == "function" then
+        deps.state.save(task_obj)
+      end
+    end
+
     emit("  Task status is '" .. tostring(task_obj.status)
-         .. "' — nothing to resume (not waiting for approval).")
+         .. "' — re-entering state machine.")
+
+    local max_steps = (opts and opts.max_steps) or 20
+    for _ = 1, max_steps do
+      if deps.task.is_terminal(task_obj) then break end
+      if deps.task.is_paused(task_obj)   then break end
+      local ok, err = M.step(deps, task_obj)
+      if not ok then
+        task_obj.error = tostring(err)
+        deps.task.transition(task_obj, deps.task.FAILED, task_obj.error)
+      end
+      if deps.state and type(deps.state.save) == "function" then
+        deps.state.save(task_obj)
+      end
+    end
+
+    if not deps.task.is_terminal(task_obj) and not deps.task.is_paused(task_obj) then
+      task_obj.error = "max steps exceeded on resume"
+      deps.task.transition(task_obj, deps.task.FAILED, task_obj.error)
+      if deps.state and type(deps.state.save) == "function" then
+        deps.state.save(task_obj)
+      end
+    end
+
     return task_obj
   end
 

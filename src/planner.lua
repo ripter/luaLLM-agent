@@ -60,6 +60,19 @@ A plan.md has three sections, in this order:
 - Do NOT wrap the plan.md in a ```markdown fence.
 - Do NOT add any text before the optional `#` title or after the `## prompt` content.
 
+## Tests are MANDATORY
+
+Every plan MUST include:
+1. A `test_runner:` line — a shell command that runs the generated code and exits 0 on success.
+   For Lua programs use `lua <output_file>`. For libraries use `lua <test_file>`.
+2. At least one `test_goal:` line describing what the test proves.
+3. The `## prompt` must instruct the LLM to write code that is directly runnable
+   and exits 0 on success, non-zero on failure — no placeholders, no stubs.
+
+The test_runner command will be executed automatically after code generation.
+If it exits non-zero, the plan will be retried with the error output provided.
+This is the primary quality gate — if your test_runner is wrong, the loop will retry forever.
+
 ## Example
 
 # Add input validation to config loader
@@ -71,7 +84,7 @@ context: src/config.lua
 context: src/config_test.lua
 output: src/config.lua
 output: src/config_test.lua
-test_runner: busted
+test_runner: lua src/config_test.lua
 test_goal: rejects non-string keys
 test_goal: returns nil for missing keys
 
@@ -82,7 +95,11 @@ You are a Lua code generator. Output ONLY valid Lua source code. No markdown fen
 Add input validation to `src/config.lua`:
 - `config.get(key)` must return `nil, "key must be a string"` when key is not a string.
 - `config.set(key, value)` must return `nil, "key must be a string"` when key is not a string.
-Update the busted tests in `src/config_test.lua` to cover both error paths.
+
+Also write a self-contained test file `src/config_test.lua` that:
+- requires config
+- asserts each error path
+- prints "OK" and exits 0 if all pass, prints the failure and exits 1 otherwise.
 ]]
 end
 
@@ -111,19 +128,24 @@ local function extract_content(response)
   return content, nil
 end
 
---- Resolve the model to use: prefer opts.model, then config default, then nil.
-local function resolve_model(deps, opts)
-  if opts and opts.model then return opts.model end
-  if deps.config then
-    local m = deps.config.get("model")
-    if m and m ~= "" then return m end
+--- Resolve the model+port to use for an LLM call.
+--- Calls luallm.state() then luallm.resolve_model(state) — the single
+--- source of truth for model selection (config > running server > last_used).
+--- Returns (model_name, port) or (nil, nil).
+local function resolve_model(deps)
+  if not deps.luallm then return nil, nil end
+  local state, err = deps.luallm.state()
+  if not state then
+    return nil, nil
   end
-  return nil
+  return deps.luallm.resolve_model(state)
 end
 
 --- Write text to path via safe_fs.  Returns (true, nil) or (nil, error).
 local function write_plan(deps, path, text)
-  local ok, err = deps.safe_fs.write_file(path, text)
+  local allowed = deps.config.get("allowed_paths") or {}
+  local blocked = deps.config.get("blocked_paths") or {}
+  local ok, err = deps.safe_fs.write_file(path, text, allowed, blocked)
   if not ok then
     return nil, "planner: failed to write plan file '" .. path .. "': " .. tostring(err)
   end
@@ -194,14 +216,15 @@ function M.generate(deps, prompt, opts)
   local user_msg = table.concat(parts, "\n")
 
   -- Call the LLM.
-  local model   = resolve_model(deps, opts)
-  local call_opts = {}
-  if model then call_opts.model = model end
+  local model, port = resolve_model(deps)
+  if not model then
+    return nil, "planner.generate: no model available — start luallm and load a model"
+  end
 
-  local response, llm_err = deps.luallm.complete({
-    system   = M.system_prompt(),
-    messages = { { role = "user", content = user_msg } },
-  }, call_opts)
+  local response, llm_err = deps.luallm.complete(model, {
+    { role = "system", content = M.system_prompt() },
+    { role = "user",   content = user_msg },
+  }, nil, port)
 
   if not response then
     return nil, "planner.generate: LLM call failed: " .. tostring(llm_err)
@@ -290,14 +313,15 @@ Produce a revised plan.md that avoids the same failure.
   local user_msg = table.concat(parts, "\n\n")
 
   -- Call the LLM.
-  local model     = resolve_model(deps, opts)
-  local call_opts = {}
-  if model then call_opts.model = model end
+  local model, port = resolve_model(deps)
+  if not model then
+    return nil, "planner.replan: no model available — start luallm and load a model"
+  end
 
-  local response, llm_err = deps.luallm.complete({
-    system   = M.system_prompt(),
-    messages = { { role = "user", content = user_msg } },
-  }, call_opts)
+  local response, llm_err = deps.luallm.complete(model, {
+    { role = "system", content = M.system_prompt() },
+    { role = "user",   content = user_msg },
+  }, nil, port)
 
   if not response then
     return nil, "planner.replan: LLM call failed: " .. tostring(llm_err)

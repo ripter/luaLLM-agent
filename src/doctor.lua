@@ -191,6 +191,136 @@ checks[#checks+1] = {
   end,
 }
 
+-- 7b. State dir is in allowed_paths -------------------------------------------
+-- The agent writes plan.md files into the state directory.  Without write
+-- access there, commands like `agent run` and `plan run` will fail.
+checks[#checks+1] = {
+  run = function()
+    pcall(config.load)
+    local state_dir = config.default_dir() .. "/state"
+    local ok, paths = pcall(config.get, "allowed_paths")
+    paths = (ok and type(paths) == "table") and paths or {}
+
+    for _, p in ipairs(paths) do
+      if p == state_dir then
+        return { name = "State dir in allowed_paths", ok = true,
+                 detail = state_dir }
+      end
+    end
+
+    return { name = "State dir in allowed_paths", ok = false,
+             detail = state_dir .. " is not in allowed_paths.\n"
+                   .. "The agent writes plan files here. Without it, `agent run` and\n"
+                   .. "`plan run` will fail with a write-denied error.\n"
+                   .. "Add it to your config.json:\n"
+                   .. '  "allowed_paths": ["' .. state_dir .. '", ...]' }
+  end,
+  -- No auto-fix: allowed_paths is 100% human-controlled.
+}
+
+-- Helper: read agent.output_dir from the raw config file (not merged defaults).
+-- Returns the string value, or nil if not set by the user.
+local function raw_output_dir()
+  local cjson = require("cjson.safe")
+  local path  = config.default_path()
+  local f     = io.open(path, "r")
+  if not f then return nil end
+  local raw = f:read("*a")
+  f:close()
+  local parsed = cjson.decode(raw)
+  if type(parsed) ~= "table" then return nil end
+  if type(parsed.agent) ~= "table" then return nil end
+  local dir = parsed.agent.output_dir
+  if type(dir) ~= "string" or dir == "" then return nil end
+  -- Expand ~ so lfs.attributes and glob checks work correctly.
+  local pl_path = require("pl.path")
+  return pl_path.expanduser(dir)
+end
+
+-- 7c. agent.output_dir is configured -----------------------------------------
+checks[#checks+1] = {
+  run = function()
+    local dir = raw_output_dir()
+    if dir then
+      return { name = "agent.output_dir configured", ok = true, detail = dir }
+    else
+      return { name = "agent.output_dir configured", ok = false,
+               detail = "agent.output_dir is not set in your config.json.\n"
+                     .. "Agent task outputs will have nowhere to go.\n"
+                     .. "Add to your config.json:\n"
+                     .. '  "agent": { "output_dir": "~/agent_wrote" }' }
+    end
+  end,
+  -- No auto-fix: the user must choose their preferred output location.
+}
+
+-- 7d. agent.output_dir exists on disk -----------------------------------------
+checks[#checks+1] = {
+  run = function()
+    local dir = raw_output_dir()
+    if not dir then
+      return { name = "agent.output_dir exists", ok = false,
+               detail = "agent.output_dir is not configured (see previous check)" }
+    end
+    local attr = lfs.attributes(dir)
+    if attr and attr.mode == "directory" then
+      return { name = "agent.output_dir exists", ok = true, detail = dir }
+    else
+      return { name = "agent.output_dir exists", ok = false,
+               detail = "directory not found: " .. dir .. "\n"
+                     .. "Run with --fix to create it, or create it manually:\n"
+                     .. "  mkdir -p " .. dir }
+    end
+  end,
+  fix = function()
+    local dir = raw_output_dir()
+    if not dir then
+      return { ok = false, detail = "agent.output_dir is not configured" }
+    end
+    local util = require("util")
+    local ok, err = util.mkdir_p(dir)
+    if ok then
+      return { ok = true, detail = "created " .. dir }
+    else
+      return { ok = false, detail = "mkdir failed: " .. tostring(err) }
+    end
+  end,
+}
+
+-- 7e. agent.output_dir is covered by allowed_paths ----------------------------
+-- Without this, every agent task will fail with a write-denied error when
+-- trying to write generated files into the task output directory.
+checks[#checks+1] = {
+  run = function()
+    local dir = raw_output_dir()
+    if not dir then
+      return { name = "agent.output_dir in allowed_paths", ok = false,
+               detail = "agent.output_dir is not configured (see previous check)" }
+    end
+    pcall(config.load)
+    local ok, paths = pcall(config.get, "allowed_paths")
+    paths = (ok and type(paths) == "table") and paths or {}
+
+    local safe_fs = require("safe_fs")
+    -- Probe a representative nested path to test real glob matching.
+    local probe = dir:gsub("/*$", "") .. "/test-task-id/main.lua"
+    for _, p in ipairs(paths) do
+      if safe_fs.glob_match(probe, p) then
+        return { name = "agent.output_dir in allowed_paths", ok = true,
+                 detail = dir .. " is covered by pattern: " .. p }
+      end
+    end
+
+    local glob = dir:gsub("/*$", "") .. "/*"
+    return { name = "agent.output_dir in allowed_paths", ok = false,
+             detail = dir .. " is not covered by any allowed_paths pattern.\n"
+                   .. "Generated files will be denied by safe_fs.\n"
+                   .. "Add to your config.json allowed_paths:\n"
+                   .. '  "' .. glob .. '"' }
+  end,
+  -- No auto-fix: allowed_paths is human-controlled.
+}
+
 -- 8. No pattern overlap between allowed_paths and blocked_paths ---------------
 checks[#checks+1] = {
   run = function()
@@ -215,6 +345,78 @@ checks[#checks+1] = {
                detail = "pattern(s) in both allowed_paths and blocked_paths:\n"
                      .. "  " .. table.concat(overlaps, "\n  ") }
     end
+  end,
+}
+
+-- 9. luallm server is running with at least one loaded model ------------------
+checks[#checks+1] = {
+  run = function()
+    local luallm = require("luallm")
+    local state, err = luallm.state()
+    if not state then
+      return { name = "luallm server running", ok = false,
+               detail = "could not reach luallm daemon: " .. tostring(err) .. "\n"
+                     .. "Start it with:  luallm start <model>" }
+    end
+
+    local running = {}
+    for _, s in ipairs(state.servers or {}) do
+      if s.state == "running" then
+        running[#running + 1] = s.model .. " (port " .. tostring(s.port) .. ")"
+      end
+    end
+
+    if #running == 0 then
+      local hint = "Start a model with:  luallm start <model>"
+      if state.last_used and state.last_used ~= "" then
+        hint = "Restart last-used model with:  luallm start " .. state.last_used
+      end
+      return { name = "luallm server running", ok = false,
+               detail = "luallm daemon is reachable but no model is currently loaded.\n"
+                     .. hint }
+    end
+
+    return { name = "luallm server running", ok = true,
+             detail = table.concat(running, ", ") }
+  end,
+}
+
+-- 10. A model can be resolved for agent tasks ---------------------------------
+checks[#checks+1] = {
+  run = function()
+    local luallm = require("luallm")
+
+    -- Check config key first.
+    pcall(config.load)
+    local model
+    pcall(function()
+      model = config.get("luallm.model")
+    end)
+    if model and model ~= "" then
+      return { name = "Agent model resolvable", ok = true,
+               detail = model .. " (from config)" }
+    end
+
+    -- Ask luallm.state() directly — ground truth.
+    local state, state_err = luallm.state()
+    if state then
+      local resolved, port = luallm.resolve_model(state)
+      if resolved and resolved ~= "" then
+        return { name = "Agent model resolvable", ok = true,
+                 detail = resolved .. " (live, port " .. tostring(port) .. ")"
+                       .. "\n      Tip: pin it in config.json to avoid surprises:"
+                       .. '\n        "luallm": { "model": "' .. resolved .. '" }' }
+      end
+      local hint = state.last_used and state.last_used ~= ""
+        and "Restart last-used model:  luallm start " .. state.last_used
+        or  "Start a model with:       luallm start <model>"
+      return { name = "Agent model resolvable", ok = false,
+               detail = "luallm is running but no model is loaded.\n" .. hint }
+    end
+
+    return { name = "Agent model resolvable", ok = false,
+             detail = "Could not reach luallm: " .. tostring(state_err) .. "\n"
+                   .. "Start it with:  luallm start <model>" }
   end,
 }
 

@@ -9,30 +9,33 @@ local M = {}
 -- Status constants
 -- ---------------------------------------------------------------------------
 
-M.PENDING    = "pending"
-M.PLANNING   = "planning"
-M.EXECUTING  = "executing"
-M.TESTING    = "testing"
-M.APPROVAL   = "approval"
-M.REPLANNING = "replanning"
-M.COMPLETE   = "complete"
-M.FAILED     = "failed"
+M.PENDING         = "pending"
+M.PLANNING        = "planning"
+M.EXECUTING       = "executing"
+M.TESTING         = "testing"
+M.APPROVAL        = "approval"
+M.AWAITING_HUMAN  = "awaiting_human"
+M.REPLANNING      = "replanning"
+M.COMPLETE        = "complete"
+M.FAILED          = "failed"
 
 -- ---------------------------------------------------------------------------
 -- Legal transition table
 -- ---------------------------------------------------------------------------
 
 local TRANSITIONS = {
-  [M.PENDING]    = { [M.PLANNING]   = true },
-  [M.PLANNING]   = { [M.EXECUTING]  = true, [M.FAILED]     = true },
-  [M.EXECUTING]  = { [M.TESTING]    = true, [M.COMPLETE]   = true,
-                     [M.REPLANNING] = true, [M.FAILED]     = true },
-  [M.TESTING]    = { [M.APPROVAL]   = true, [M.REPLANNING] = true,
-                     [M.FAILED]     = true },
-  [M.APPROVAL]   = { [M.COMPLETE]   = true, [M.FAILED]     = true },
-  [M.REPLANNING] = { [M.PLANNING]   = true, [M.FAILED]     = true },
-  [M.COMPLETE]   = {},
-  [M.FAILED]     = {},
+  [M.PENDING]        = { [M.PLANNING]        = true },
+  [M.PLANNING]       = { [M.EXECUTING]       = true, [M.FAILED]        = true },
+  [M.EXECUTING]      = { [M.TESTING]         = true, [M.COMPLETE]      = true,
+                         [M.REPLANNING]      = true, [M.FAILED]        = true,
+                         [M.AWAITING_HUMAN]  = true },
+  [M.TESTING]        = { [M.APPROVAL]        = true, [M.REPLANNING]    = true,
+                         [M.FAILED]          = true, [M.AWAITING_HUMAN] = true },
+  [M.APPROVAL]       = { [M.COMPLETE]        = true, [M.FAILED]        = true },
+  [M.AWAITING_HUMAN] = { [M.EXECUTING]       = true, [M.FAILED]        = true },
+  [M.REPLANNING]     = { [M.PLANNING]        = true, [M.FAILED]        = true },
+  [M.COMPLETE]       = {},
+  [M.FAILED]         = {},
 }
 
 -- ---------------------------------------------------------------------------
@@ -146,9 +149,9 @@ function M.is_terminal(t)
   return t.status == M.COMPLETE or t.status == M.FAILED
 end
 
---- Return true if the task is paused waiting for human input (APPROVAL).
+--- Return true if the task is paused waiting for human input.
 function M.is_paused(t)
-  return t.status == M.APPROVAL
+  return t.status == M.APPROVAL or t.status == M.AWAITING_HUMAN
 end
 
 --- Return true if the attempt counter for key is below the max.
