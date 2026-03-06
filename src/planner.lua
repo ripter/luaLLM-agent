@@ -73,6 +73,14 @@ The test_runner command will be executed automatically after code generation.
 If it exits non-zero, the plan will be retried with the error output provided.
 This is the primary quality gate — if your test_runner is wrong, the loop will retry forever.
 
+## Critical Lua code rules — include these verbatim in every ## prompt
+
+The generated Lua code MUST follow these rules or it will fail immediately:
+- NEVER use `...` (vararg) outside a function declared with `...` as a parameter. At file scope, use `arg` table instead: `local script = arg[0]`, `local first = arg[1]`.
+- NEVER use backtick characters (`) anywhere in Lua code. Lua has no template literals.
+- When using lsqlite3: use `db:exec()`, `db:prepare()`, `stmt:step()`, `stmt:get_value(col)`, `stmt:bind(col,val)`, `stmt:finalize()`. Do NOT use `:cursor()`, `:uquery()`, `:query()`, `:fetch()` — those are luasql methods and do not exist in lsqlite3.
+- Output ONLY valid Lua code. No markdown fences, no backticks, no explanations.
+
 ## Example
 
 # Add input validation to config loader
@@ -308,7 +316,15 @@ Produce a revised plan.md that avoids the same failure.
 - If the generated code failed tests, adjust the `## prompt` to fix the logic.
 - If the plan referenced wrong file paths, correct the `context:` or `output:` lines.
 - If the test_runner or test_goals are wrong, update them.
-- Output ONLY the revised plan.md document.]]
+- Output ONLY the revised plan.md document.
+
+## Mandatory Lua rules to include in the revised ## prompt
+
+The ## prompt section MUST explicitly tell the code generator:
+- NEVER use `...` (vararg) at file scope. Use `arg[0]`, `arg[1]` etc instead.
+- NEVER use backtick (`) characters anywhere — Lua has no template literals.
+- If using lsqlite3: only use `db:exec()`, `db:prepare()`, `stmt:step()`, `stmt:get_value(col)`, `stmt:bind(col,val)`, `stmt:finalize()`. No `:cursor()`, `:uquery()`, `:query()`, `:fetch()`.
+- Output ONLY valid Lua. No markdown, no fences, no commentary.]]
 
   local user_msg = table.concat(parts, "\n\n")
 

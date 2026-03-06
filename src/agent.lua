@@ -202,6 +202,102 @@ end
 local function handle_executing(deps, t)
   local plan_deps = make_cmd_plan_deps(deps)
 
+  -- If we have a fix_context from a previous logic failure, run a targeted
+  -- fix pass: load the plan to get output paths, then re-generate each output
+  -- with the current file content + fix instruction as context.
+  if t.fix_context then
+    local fix = t.fix_context
+    t.fix_context = nil   -- consume it
+
+    local plan_table
+    if deps.plan and t.plan_path then
+      local pt, _ = deps.plan.load_file(t.plan_path)
+      plan_table = pt
+    end
+
+    local output_paths = (plan_table and plan_table.outputs) or t.outputs or {}
+    local emit = deps.print or function(_) end
+    local util = require("util")
+
+    for _, output_path in ipairs(output_paths) do
+      emit("  fixing → " .. output_path .. " …")
+
+      -- Build context: current file contents + fix instruction
+      local current = util.read_file(output_path)
+      local fix_prompt = fix.prompt
+      if current then
+        fix_prompt = "Current file contents:\n\n" .. current .. "\n\n" .. fix.prompt
+      end
+
+      local gen_deps = {
+        luallm       = deps.luallm,
+        safe_fs      = deps.safe_fs,
+        config       = deps.config,
+        cmd_generate = deps.cmd_generate,
+      }
+
+      local ok, info = deps.cmd_generate.run(gen_deps, {
+        output_path = output_path,
+        prompt      = fix_prompt,
+      })
+
+      if not ok then
+        local err = tostring(info)
+        t.error = err
+        if deps.task.can_retry(t, "plan") then
+          deps.task.transition(t, deps.task.REPLANNING,
+            "fix pass failed (will replan): " .. err)
+        else
+          deps.task.transition(t, deps.task.FAILED,
+            "fix pass failed (no retries left): " .. err)
+        end
+        return t
+      end
+
+      emit("  ✓ " .. output_path .. "  (" .. (info.model or "?") .. ", " .. (info.tokens or "?") .. " tokens)")
+    end
+
+    -- Fall through to test_runner check below with the same plan_table
+    t.outputs = output_paths
+
+    -- Run test_runner on the fixed code (reuse plan_table loaded above)
+    if plan_table and plan_table.test_runner and plan_table.test_runner ~= "" then
+      local run_dir = t.output_dir or "."
+      local runner  = plan_table.test_runner
+      local cmd     = string.format("cd '%s' && %s 2>&1", run_dir:gsub("'", "'\\''"), runner)
+      emit("  running test_runner: " .. runner)
+      local handle   = io.popen(cmd, "r")
+      local output   = handle and handle:read("*a") or ""
+      local pok, _, exit_code = handle and handle:close()
+      exit_code = (type(pok) == "number") and pok or (exit_code or (pok and 0 or 1))
+      if exit_code ~= 0 then
+        emit("  ✗ test_runner failed after fix (exit " .. tostring(exit_code) .. "):")
+        emit("    " .. output:gsub("\n", "\n    "):match("^(.-)%s*$"))
+        local err_msg = "test_runner failed after fix:\n" .. output
+        t.error = err_msg
+        -- Store another fix_context for next attempt
+        t.fix_context = {
+          error  = output,
+          prompt = "The previous fix attempt still has this failure:\n" .. output
+                .. "\n\nFix only the specific problem. Keep all working parts unchanged. "
+                .. "Output the complete corrected file.",
+        }
+        if deps.task.can_retry(t, "plan") then
+          deps.task.bump_attempt(t, "plan")
+          deps.task.transition(t, deps.task.EXECUTING, "fix attempt failed, trying again")
+        else
+          deps.task.transition(t, deps.task.FAILED, "fix attempts exhausted")
+        end
+        return t
+      end
+      emit("  ✓ test_runner passed")
+      t.error = nil
+    end
+
+    deps.task.transition(t, deps.task.COMPLETE, "fixed and verified")
+    return t
+  end
+
   local ok, err = deps.cmd_plan.run(
     { subcommand = "run", plan_path = t.plan_path },
     plan_deps
@@ -311,12 +407,35 @@ local function handle_executing(deps, t)
         return t
       end
 
+      -- Classify the failure:
+      -- SYNTAX errors (can't parse at all) → full replan, new code from scratch
+      -- LOGIC errors (runs but output wrong) → re-execute with current code as context + fix instruction
+      local is_syntax_error = output:match("unexpected symbol") or
+                              output:match("'<eof>'") or
+                              output:match("'<name>'") or
+                              output:match("near '[^']+'")
+
       t.error = err_msg
       emit("  ✗ test_runner failed (exit " .. tostring(exit_code) .. "):")
       emit("    " .. output:gsub("\n", "\n    "):match("^(.-)%s*$"))
-      if deps.task.can_retry(t, "plan") then
+
+      if not is_syntax_error and deps.task.can_retry(t, "plan") then
+        -- Logic failure: keep the existing plan but inject error context so
+        -- the generator patches the code rather than rewriting from scratch.
+        -- Store error for the next execute pass to use as additional context.
+        t.fix_context = {
+          error  = output,
+          prompt = "The previous version had this test failure:\n" .. output
+                .. "\n\nFix only the specific problem described above. "
+                .. "Keep all working parts of the code unchanged. "
+                .. "Output the complete corrected file.",
+        }
+        deps.task.bump_attempt(t, "plan")
+        deps.task.transition(t, deps.task.EXECUTING,
+          "logic failure, re-executing with fix context")
+      elseif deps.task.can_retry(t, "plan") then
         deps.task.transition(t, deps.task.REPLANNING,
-          "test_runner failed (will retry): " .. err_msg)
+          "syntax failure, replanning: " .. err_msg)
       else
         deps.task.transition(t, deps.task.FAILED,
           "test_runner failed (no retries left): " .. err_msg)
@@ -589,6 +708,21 @@ local function handle_replanning(deps, t)
     end
   end
 
+  -- Include the actual generated file contents so the LLM can see what it wrote.
+  if t.output_dir and type(t.outputs) == "table" then
+    local util = require("util")
+    local file_parts = {}
+    for _, path in ipairs(t.outputs) do
+      local content, _ = util.read_file(path)
+      if content then
+        file_parts[#file_parts + 1] = "--- " .. path .. " ---\n" .. content
+      end
+    end
+    if #file_parts > 0 then
+      error_info.skill_code = table.concat(file_parts, "\n\n")
+    end
+  end
+
   -- Clear the old plan_path so handle_planning does not short-circuit on the
   -- stale path; replan will set a new one below.
   t.plan_path = nil
@@ -770,6 +904,51 @@ function M.resume(deps, task_obj, opts)
     return nil, "agent.resume: task_obj must be a table"
   end
 
+  -- Allow human-directed retry from FAILED.
+  if task_obj.status == deps.task.FAILED then
+    emit("  Task failed previously. Checking what can be salvaged...")
+    task_obj.attempts = { plan = 0, replan = 0, test = 0 }
+    task_obj.error    = nil
+
+    -- If output files already exist on disk, go straight to fix mode
+    -- rather than replanning from scratch.
+    local lfs = require("lfs")
+    local outputs_exist = false
+    if type(task_obj.outputs) == "table" and #task_obj.outputs > 0 then
+      outputs_exist = true
+      for _, path in ipairs(task_obj.outputs) do
+        local attr = lfs.attributes(path)
+        if not attr or attr.mode ~= "file" then
+          outputs_exist = false
+          break
+        end
+      end
+    end
+
+    if outputs_exist and task_obj.plan_path then
+      emit("  Output files exist — will attempt targeted fix rather than full replan.")
+      -- Reload plan_text so replan has context
+      task_obj.plan_text = read_plan_text(task_obj.plan_path) or task_obj.plan_text
+      -- Set fix_context so handle_executing does a patch pass
+      task_obj.fix_context = {
+        error  = "Previous run hit step limit. Tests were still failing.",
+        prompt = "The previous attempt ran out of retries. "
+              .. "Review the code and fix any remaining issues so all tests pass. "
+              .. "Output the complete corrected file.",
+      }
+      deps.task.transition(task_obj, deps.task.EXECUTING, "human-directed retry with fix context")
+    else
+      emit("  No output files found — will replan from scratch.")
+      task_obj.plan_path = nil
+      task_obj.plan_text = nil
+      deps.task.transition(task_obj, deps.task.REPLANNING, "human-directed retry, replanning")
+    end
+
+    if deps.state and type(deps.state.save) == "function" then
+      deps.state.save(task_obj)
+    end
+  end
+
   -- If the task is in a non-terminal, non-paused status (e.g. crashed mid-flight
   -- while executing or planning), re-drive it through the state machine.
   if task_obj.status ~= deps.task.APPROVAL then
@@ -797,13 +976,20 @@ function M.resume(deps, task_obj, opts)
     emit("  Task status is '" .. tostring(task_obj.status)
          .. "' — re-entering state machine.")
 
+    -- On human-directed retry, reload plan_text from disk if plan_path exists
+    -- so handle_replanning has context to give the LLM.
+    if task_obj.plan_path and (not task_obj.plan_text or task_obj.plan_text == "") then
+      task_obj.plan_text = read_plan_text(task_obj.plan_path)
+    end
+
     local max_steps = (opts and opts.max_steps) or 20
     for _ = 1, max_steps do
       if deps.task.is_terminal(task_obj) then break end
       if deps.task.is_paused(task_obj)   then break end
-      local ok, err = M.step(deps, task_obj)
+      local ok, step_err = M.step(deps, task_obj)
       if not ok then
-        task_obj.error = tostring(err)
+        task_obj.error = tostring(step_err)
+        emit("  ✗ step error: " .. task_obj.error)
         deps.task.transition(task_obj, deps.task.FAILED, task_obj.error)
       end
       if deps.state and type(deps.state.save) == "function" then

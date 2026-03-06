@@ -35,7 +35,7 @@ local TRANSITIONS = {
   [M.AWAITING_HUMAN] = { [M.EXECUTING]       = true, [M.FAILED]        = true },
   [M.REPLANNING]     = { [M.PLANNING]        = true, [M.FAILED]        = true },
   [M.COMPLETE]       = {},
-  [M.FAILED]         = {},
+  [M.FAILED]         = { [M.REPLANNING]      = true },  -- human-directed retry only
 }
 
 -- ---------------------------------------------------------------------------
