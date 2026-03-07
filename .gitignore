@@ -1,6 +1,7 @@
 .DS_Store
 agent
 agent_wrote/
+plan_code/
 
 # Compiled Lua sources
 luac.out
